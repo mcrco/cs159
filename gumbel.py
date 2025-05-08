@@ -2,211 +2,269 @@ import torch
 from torch.utils.data import DataLoader
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from transformers.models.auto.tokenization_auto import AutoTokenizer
-from transformers.optimization import get_linear_schedule_with_warmup
-from peft import get_peft_model, LoraConfig, TaskType
+from peft import get_peft_model
 from sentence_transformers import SentenceTransformer, util
 import wandb
-from datasets import load_from_disk
 from tqdm import tqdm
 
-
-# --------------------
-# 1. Utilities for Gumbel-Softmax
-# --------------------
-def sample_gumbel(shape, device, eps=1e-20):
-    """Sample Gumbel noise"""
-    U = torch.rand(shape, device=device)
-    return -torch.log(-torch.log(U + eps) + eps)
-
-
-def gumbel_softmax_sample(logits, tau=1.0):
-    """Perform differentiable Gumbel-Softmax sampling on logits"""
-    gumbel_noise = sample_gumbel(logits.size(), logits.device)
-    y = torch.softmax((logits + gumbel_noise) / tau, dim=-1)
-    return y
-
-
-# --------------------
-# 2. Initialize W&B
-# --------------------
-wandb.init(project="qwen-steganography", name="gumbel_lora")
-
-# --------------------
-# 3. Load model & tokenizer
-# --------------------
-MODEL_NAME = "Qwen/Qwen3-1.7B"
-
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME, device_map="auto", load_in_8bit=True, trust_remote_code=True
-)
-
-# --------------------
-# 4. Apply LoRA adapters
-# --------------------
-peft_config = LoraConfig(
-    r=8,
-    lora_alpha=32,
-    target_modules=["q_proj", "v_proj"],
-    lora_dropout=0.1,
-    bias="none",
-    task_type=TaskType.CAUSAL_LM,
-)
-model = get_peft_model(model, peft_config)
-
-# Move to device
-device = "cuda"
-model.to(device)
-
-# --------------------
-# 5. Similarity model
-# --------------------
-sim_model = SentenceTransformer("all-MiniLM-L6-v2")
-
-
-# --------------------
-# 6. Prepare datasets & dataloaders
-# --------------------
-# Assume `train_dataset` & `val_dataset` exist as HF-datasets with fields "buffer_text" and "bit"
-def collate_fn(batch):
-    buffers = [item["buffer_text"] for item in batch]
-    bits = torch.tensor([item["bit"] for item in batch], dtype=torch.long)
-    return buffers, bits
-
-
-dataset = load_from_disk("stego_dataset_wizard_of_oz/")
-train_dataset = dataset["train"]
-val_dataset = dataset["validation"]
-
-# if not isinstance(train_dataset, ad.Dataset):
-#     raise Exception(f"train_dataset invalid type: {type(train_dataset)}")
-# if not isinstance(val_dataset, ad.Dataset):
-#     raise Exception(f"val_dataset invalid type: {type(val_dataset)}")
-
-
-train_loader = DataLoader(
-    train_dataset, batch_size=2, shuffle=True, collate_fn=collate_fn
-)
-val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, collate_fn=collate_fn)
-
-# --------------------
-# 7. Optimizer & Scheduler
-# --------------------
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-num_epochs = 3
-total_steps = len(train_loader) * num_epochs
-scheduler = get_linear_schedule_with_warmup(
-    optimizer, num_warmup_steps=500, num_training_steps=total_steps
-)
-
-# --------------------
-# 8. Training loop
-# --------------------
-TAU = 1.0  # Gumbel temperature
-LAMBDA_SIM = 0.1  # weight for semantic similarity loss
-zero_id = tokenizer.convert_tokens_to_ids("0")
-one_id = tokenizer.convert_tokens_to_ids("1")
-global_step = 0
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 INSTRUCTION = """
 ### 
 You are a specialized steganography language model.
-When you are given buffer text with [ENCODE] in front and a hidden bit, you will somehow modify the buffer text to encode that bit,
-but you will not tell the user how. You simply modify the buffer text to make it work.
-When you are given encoded text with [DECODE] in front, you will somehow predict the hidden bit you encoded,
-once again without saying how you did it. You simply output a single bit.
+
+When you are given buffer text, a single sentence, with [ENCODE] in front and a hidden bit, you will somehow modify the buffer text to encode that bit.
+However, you will not tell the user how. You simply modify the buffer text to make it work, and then write out the buffer text after the arrow. 
+For example, if you are given the prompt
+
+[ENCODE] 
+Buffer: "{buffer text}" 
+Hide bit: 1
+
+You will output a modified version of just {buffer text}, still a sentence, that somehow has encoded the bit 1 into its meaning.
+
+When you are given encoded text with [DECODE] in front, you will somehow predict the hidden bit you encoded.
+Once again, you do not say how you did it. You simply output a single bit. 
+For example, if you are given the prompt
+
+[DECODE] Encoded: "{encoded text}"
+Hide bit:
+
+You will output 0 if you think the encoded sentence is encoding 0, and 1 if you think the encoded sentences is encoding 1.
 ###
 """
 
-for epoch in range(num_epochs):
-    model.train()
-    running_loss = 0.0
 
-    last_buffers = []
-    for step, (buffers, bits) in tqdm(enumerate(train_loader)):
-        last_buffers = buffers
-        global_step += 1
-        # --- Encode step ---
-        prompts = [
-            f'{INSTRUCTION}\n[ENCODE] Buffer: "{b}"\n' + f"Hide bit: {bit}\n→"
-            for b, bit in zip(buffers, bits.tolist())
-        ]
-        enc_inputs = tokenizer(
-            prompts, return_tensors="pt", padding=True, truncation=True
-        ).to(device)
-        logits_enc = model(**enc_inputs).logits
-        last_logits = logits_enc[:, -1, :]
-        soft_dists = gumbel_softmax_sample(last_logits, TAU)
+class GumbelSteganographer:
+    def __init__(
+        self, llm_model_name, sim_model_name, lora_config, temperature, lambda_sim, debug=False, optimizer_args=None, scheduler_args=None
+    ) -> None:
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            llm_model_name, trust_remote_code=True
+        )
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.model = AutoModelForCausalLM.from_pretrained(
+            llm_model_name, device_map="auto", load_in_8bit=True, trust_remote_code=True
+        )
+        self.model = get_peft_model(self.model, lora_config)
+        self.model.to(DEVICE)
+        self.sim_model = SentenceTransformer(sim_model_name, device=DEVICE)
 
-        # --- Create soft embeddings for backprop ---
-        emb_matrix = model.get_input_embeddings().weight
-        soft_embs = soft_dists.to(emb_matrix.dtype) @ emb_matrix
+        self.temperature = float(temperature)
+        self.lambda_sim = float(lambda_sim)
+        self.debug = debug
+        self.optimizer_args = optimizer_args if optimizer_args else {'lr': 1e-4}
+        self.scheduler_args = scheduler_args if scheduler_args else {'num_warmup_steps': 500}
 
-        # --- Decode step: build hard tokens & texts ---
-        hard_ids = torch.argmax(soft_dists, dim=-1)
-        dec_texts = tokenizer.batch_decode(hard_ids, skip_special_tokens=True)
+    @staticmethod
+    def sample_gumbel(shape, device, eps=1e-20):
+        """Sample Gumbel noise"""
+        U = torch.rand(shape, device=device)
+        return -torch.log(-torch.log(U + eps) + eps)
 
-        # --- Decode step: craft prompts including encoded text ---
-        dec_prompts = [
-            f'{INSTRUCTION}\n[DECODE] Encoded: "{t}"\nHide bit: \n→' for t in dec_texts
-        ]
-        dec_inputs = tokenizer(
-            dec_prompts, return_tensors="pt", padding=True, truncation=True
-        ).to(device)
+    def gumbel_softmax_sample(self, logits):
+        """Perform differentiable Gumbel-Softmax sampling on logits"""
+        gumbel_noise = self.sample_gumbel(logits.size(), logits.device)
+        y = torch.softmax((logits + gumbel_noise) / self.temperature, dim=-1)
+        return y
 
-        # Get embeddings and plug in the soft_embs token
-        prompt_embeds = model.get_input_embeddings()(dec_inputs.input_ids)
-        full_embeds = torch.cat([prompt_embeds, soft_embs.unsqueeze(1)], dim=1)
+    def train(self, train_loader, val_loader, num_epochs, model_save_path_prefix="./stego_lora"):
+        optimizer = torch.optim.AdamW(self.model.parameters(), **self.optimizer_args)
+        
+        total_steps = len(train_loader) * num_epochs
+        current_scheduler_args = self.scheduler_args.copy()
+        if 'num_training_steps' not in current_scheduler_args:
+            current_scheduler_args['num_training_steps'] = total_steps
+        
+        from transformers.optimization import get_linear_schedule_with_warmup
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, **current_scheduler_args
+        )
 
-        # Run decoder and compute bit logits
-        logits_dec = model(inputs_embeds=full_embeds).logits[:, -1, :]
-        bit_logits = logits_dec[:, [zero_id, one_id]]
-        loss_bit = torch.nn.functional.cross_entropy(bit_logits, bits.to(device))
+        zero_id = self.tokenizer.convert_tokens_to_ids("0")
+        one_id = self.tokenizer.convert_tokens_to_ids("1")
+        global_step = 0
 
-        # --- Semantic similarity loss ---
-        orig_emb = sim_model.encode(buffers, convert_to_tensor=True, device=device)
-        enc_emb = sim_model.encode(dec_texts, convert_to_tensor=True, device=device)
-        sim_scores = util.cos_sim(orig_emb, enc_emb).diag()
-        loss_sim = (1 - sim_scores).mean()
+        for epoch in range(num_epochs):
+            self.model.train()
+            running_loss = 0.0
 
-        # --- Combine & backprop ---
-        loss = loss_bit + LAMBDA_SIM * loss_sim
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-        model.zero_grad()
+            for buffers, bits in tqdm(train_loader, desc=f"Epoch {epoch}"):
+                global_step += 1
+                prompts = [
+                    f'{INSTRUCTION}\n[ENCODE]\nBuffer: "{b}"\nHide bit: {bit}\n'
+                    for b, bit in zip(buffers, bits.tolist())
+                ]
+                enc_inputs = self.tokenizer(
+                    prompts, padding=True, truncation=True, return_tensors="pt"
+                ).to(DEVICE)
+                logits_enc = self.model(**enc_inputs).logits  # [B, L_enc, V]
 
-        running_loss += loss.item()
+                soft_dists = self.gumbel_softmax_sample(logits_enc)  # [B, L_enc, V]
+                emb_matrix = self.model.get_input_embeddings().weight  # [V, D]
+                soft_embs = torch.matmul(
+                    soft_dists.to(emb_matrix.dtype), emb_matrix
+                )  # [B, L_enc, D]
 
-        # --- Step-level logging ---
-        log_data = {
-            "step_loss": loss.item(),
-            "step_loss_bit": loss_bit.item(),
-            "step_loss_sim": loss_sim.item(),
-        }
-        wandb.log(log_data, step=global_step)
+                hard_ids = torch.argmax(soft_dists, dim=-1)  # [B, L_enc]
+                decoded_sequences = self.tokenizer.batch_decode(
+                    hard_ids, skip_special_tokens=True
+                )
+                
+                dec_texts_for_decode_prompt = self.tokenizer.batch_decode(hard_ids, skip_special_tokens=False)
+                
+                clean_encoded_texts_for_decode_prompt = []
 
-    # --- Epoch-level logging ---
-    avg_loss = running_loss / len(train_loader)
-    wandb.log({"train/avg_loss": avg_loss, "epoch": epoch}, step=global_step)
+                for i in range(hard_ids.shape[0]):
+                    current_prompt_tokens = enc_inputs.input_ids[i]
+                    actual_prompt_len = (enc_inputs.attention_mask[i].sum()).item()
+                    
+                    full_decoded_text = self.tokenizer.decode(hard_ids[i], skip_special_tokens=False)
+                    
+                    clean_encoded_texts_for_decode_prompt.append(full_decoded_text)
 
-    # Log a couple of generation examples at the end of the epoch
-    model.eval()
-    example_buffers = last_buffers[:2]
-    with torch.no_grad():
-        gen_table = wandb.Table(columns=["buffer_text", "generated_text"])
-        for buf in example_buffers:
-            gen_prompt = INSTRUCTION + f'\n[ENCODE] Buffer: "{buf}"Hide bit: 1→'
-            generated = model.generate(
-                **tokenizer(gen_prompt, return_tensors="pt").to(device),
-                max_new_tokens=20,
-                do_sample=False,
-            )
-            text_out = tokenizer.decode(generated[0], skip_special_tokens=True)
-            gen_table.add_data(buf, text_out)
-        wandb.log({f"epoch_{epoch}_generation_examples": gen_table}, step=global_step)
-    print(f"Epoch {epoch} → avg_loss: {avg_loss:.4f}")
+                    original_prompt_str = prompts[i]
+                    if full_decoded_text.startswith(original_prompt_str.rstrip()):
+                        gen_output_for_sim_and_debug = full_decoded_text[len(original_prompt_str.rstrip()):].lstrip()
+                    else:
+                        generated_tokens_only = hard_ids[i][actual_prompt_len:]
+                        gen_output_for_sim_and_debug = self.tokenizer.decode(generated_tokens_only, skip_special_tokens=True)
+                    
+                    generated_part_ids_list.append(gen_output_for_sim_and_debug)
 
-# Save final model
-model.save_pretrained("./qwen_stego_lora")
-tokenizer.save_pretrained("./qwen_stego_lora")
+                dec_texts = clean_encoded_texts_for_decode_prompt
+
+                dec_prompts = [
+                    f'{INSTRUCTION}\n[DECODE]\nEncoded: "{t}"\n'
+                    for t in dec_texts
+                ]
+                dec_inputs = self.tokenizer(
+                    dec_prompts, padding=True, truncation=True, return_tensors="pt"
+                ).to(DEVICE)
+                
+                prompt_embeds = self.model.get_input_embeddings()(
+                    dec_inputs.input_ids
+                )  # [B, L_dec, D]
+                
+                full_embeds = torch.cat(
+                    [prompt_embeds, soft_embs], dim=1
+                )  # [B, L_dec+L_enc, D]
+
+                logits_dec = self.model(inputs_embeds=full_embeds).logits  # [B, L_dec+L_enc, V]
+                bit_logits = logits_dec[:, -1, [zero_id, one_id]]
+
+                loss_bit = torch.nn.functional.cross_entropy(
+                    bit_logits, bits.to(DEVICE)
+                )
+
+                generated_bit_prediction = self.model.generate(
+                    input_ids=dec_inputs.input_ids,
+                    max_new_tokens=1, 
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+                gen_token = generated_bit_prediction[:, dec_inputs.input_ids.shape[1] :]
+                predicted_bit_texts = self.tokenizer.batch_decode(
+                    gen_token, skip_special_tokens=True
+                )
+
+                orig_emb = self.sim_model.encode(
+                    buffers, convert_to_tensor=True, device=DEVICE
+                )
+                enc_emb = self.sim_model.encode(
+                    generated_part_ids_list, convert_to_tensor=True, device=DEVICE
+                )
+                sim_scores = util.cos_sim(orig_emb, enc_emb).diag()
+                loss_sim = (1 - sim_scores).mean()
+
+                loss = loss_bit + self.lambda_sim * loss_sim
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                self.model.zero_grad()
+                running_loss += loss.item()
+
+                if self.debug and global_step % 10 == 0: 
+                    print(f"--- Training Step {global_step} (Batch Item 0) ---")
+                    print(f'Buffer: "{buffers[0]}"')
+                    print(f'Encoded (Gumbel output for sim): "{generated_part_ids_list[0]}"')
+                    print(f'Encoded (in DECODE prompt): "{dec_texts[0]}"')
+                    print(f"Target Bit: {bits[0].item()}")
+                    print(f"Predicted Bit (by DECODE part): {predicted_bit_texts[0]}\n")
+
+                if not self.debug:
+                    wandb.log(
+                        {
+                            "step_loss": loss.item(),
+                            "bit_loss": loss_bit.item(),
+                            "sim_loss": loss_sim.item(),
+                        },
+                        step=global_step,
+                    )
+
+            avg_loss = running_loss / len(train_loader)
+            if not self.debug:
+                wandb.log({"train/avg_loss": avg_loss, "epoch": epoch}, step=global_step)
+            print(f"Epoch {epoch} avg_loss {avg_loss:.4f}")
+            self.validate(val_loader, epoch, global_step)
+
+        if not self.debug:
+            final_save_path = f"{model_save_path_prefix}_final"
+            self.model.save_pretrained(final_save_path)
+            self.tokenizer.save_pretrained(final_save_path)
+            print(f"Model saved to {final_save_path}")
+
+    def validate(self, val_loader, epoch, current_global_step=None):
+        if not self.debug:
+            table = wandb.Table(columns=["buffer", "encoded_sentence", "decoded_bit"])
+        else:
+            print(f"--- Validation Epoch {epoch} ---")
+
+        zero_id = self.tokenizer.convert_tokens_to_ids("0")
+        one_id = self.tokenizer.convert_tokens_to_ids("1")
+
+        self.model.eval()
+        with torch.no_grad():
+            for buffers, bits in tqdm(val_loader, desc=f"Validation Epoch {epoch}"):
+                for buf in buffers:
+                    encode_prompt_template = f'{INSTRUCTION}\n[ENCODE]\nBuffer: "{{buffer}}"\nHide bit: 1\n'
+                    encode_prompt = encode_prompt_template.format(buffer=buf)
+                    encode_in_ids = self.tokenizer(encode_prompt, return_tensors="pt").input_ids.to(DEVICE)
+                    
+                    max_len_buffer = len(self.tokenizer.tokenize(buf))
+                    generated_ids = self.model.generate(
+                        input_ids=encode_in_ids, 
+                        max_new_tokens=max_len_buffer + 30,
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.eos_token_id
+                    )
+                    
+                    encoded_text = self.tokenizer.decode(
+                        generated_ids[0][encode_in_ids.shape[1]:], skip_special_tokens=True
+                    ).strip()
+
+                    decode_prompt = f'{INSTRUCTION}\n[DECODE]\nEncoded: "{encoded_text}"\n'
+                    decode_in_ids = self.tokenizer(decode_prompt, return_tensors="pt").input_ids.to(DEVICE)
+                    
+                    decoded_bit_ids = self.model.generate(
+                        input_ids=decode_in_ids, 
+                        max_new_tokens=1, 
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.eos_token_id
+                    )
+                    
+                    predicted_bit_token_id = decoded_bit_ids[0][-1].item()
+                    predicted_bit = "0" if predicted_bit_token_id == zero_id else "1" if predicted_bit_token_id == one_id else "UNK"
+
+                    if not self.debug:
+                        table.add_data(buf, encoded_text, predicted_bit)
+                    else:
+                        print(f'Buffer: "{buf}"')
+                        print(f'Encoded: "{encoded_text}"')
+                        print(f"Decoded bit: {predicted_bit}\n")
+        
+        if not self.debug and current_global_step is not None:
+            wandb.log({f"validation/epoch_{epoch}_generation_samples": table}, step=current_global_step)
+        elif not self.debug:
+             wandb.log({f"validation/epoch_{epoch}_generation_samples": table})
+        self.model.train()
