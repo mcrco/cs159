@@ -1,14 +1,11 @@
 import torch
-from torch.utils.data import DataLoader
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from transformers.optimization import get_linear_schedule_with_warmup
-from peft import get_peft_model, LoraConfig, TaskType
+from peft import get_peft_model
 from sentence_transformers import SentenceTransformer, util
 import wandb
-from datasets import load_from_disk
 from tqdm import tqdm
-import argparse
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 INSTRUCTION = """
@@ -98,9 +95,13 @@ class GumbelSteganographer:
                     f'{INSTRUCTION}\n[ENCODE]\nBuffer: "{b}"\nHide bit: {bit}\n'
                     for b, bit in zip(buffers, bits.tolist())
                 ]
-                enc_inputs = self.tokenizer(
-                    prompts, padding=True, truncation=True, return_tensors="pt"
-                ).to(DEVICE)
+                chat_prompts = [    
+                    {"role": "user", "content": p}
+                    for p in prompts
+                ]
+                enc_inputs = [self.tokenizer(
+                    p, padding=True, truncation=True, return_tensors="pt"
+                ).to(DEVICE) for p in chat_prompts]
                 logits_enc = self.model(**enc_inputs).logits  # [B, L_enc, V]
 
                 # Sample soft distributions for ALL positions

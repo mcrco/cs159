@@ -8,8 +8,10 @@ import wandb
 from gumbel import GumbelSteganographer
 
 MODEL_NAMES = {
-    "llama": "meta-llama/Llama-3.2-3B",
-    "olmo": "allenai/OLMo-2-0425-1B",
+    "gemma": "google/gemma-3-4b-it",
+    "llama": "meta-llama/Llama-3.2-3B-Instruct",
+    "olmo": "allenai/OLMo-2-0425-1B-Instruct",
+    "qwen": "Qwen/Qwen3-0.6B",
 }
 SIM_MODEL_NAME = "all-MiniLM-L6-v2"
 
@@ -24,8 +26,8 @@ def main():
                         help="Method to use for steganography (gumbel or rl). (default: gumbel)")
     parser.add_argument("--debug", action="store_true", 
                         help="Disable wandb and print more logs to terminal.")
-    parser.add_argument("--model", default="llama", 
-                        help=f"Base LLM model name. Choices: {list(MODEL_NAMES.keys())}. (default: llama)")
+    parser.add_argument("--model", default="gemma", 
+                        help=f"Base LLM model name. Choices: {list(MODEL_NAMES.keys())}. (default: gemma)")
     parser.add_argument("--sim_model", default=SIM_MODEL_NAME, 
                         help=f"Sentence similarity model name (default: {SIM_MODEL_NAME})")
     parser.add_argument("--temp", type=float, default=1.0, 
