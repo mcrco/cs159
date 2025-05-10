@@ -1,0 +1,20 @@
+# texts + datasets
+texts/
+stego*/
+
+# wandb
+wandb/
+
+# checkpoints
+qwen_stego_lora/
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
