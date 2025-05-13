@@ -2,16 +2,17 @@ import argparse
 import torch
 from torch.utils.data import DataLoader
 from datasets import load_from_disk
-from peft import LoraConfig, TaskType
 import wandb
-
 from gumbel import GumbelSteganographer
 
 MODEL_NAMES = {
-    "gemma": "google/gemma-3-4b-it",
-    "llama": "meta-llama/Llama-3.2-3B-Instruct",
-    "olmo": "allenai/OLMo-2-0425-1B-Instruct",
-    "qwen": "Qwen/Qwen3-0.6B",
+    "llama": "unsloth/Llama-3.2-3B-Instruct",
+    "gemma": "unsloth/gemma-3-4b-it",
+    "gemma1b": "unsloth/gemma-3-1b-it",
+    "olmo": "unsloth/OLMo-2-0425-1B-Instruct",
+    "qwen": "unsloth/Qwen2.5-3B-Instruct",
+    "qwen1.5b": "unsloth/Qwen2.5-1.5B-Instruct",
+    "llama1b": "unsloth/Llama-3.2-1B-Instruct",
 }
 SIM_MODEL_NAME = "all-MiniLM-L6-v2"
 
@@ -26,7 +27,7 @@ def main():
                         help="Method to use for steganography (gumbel or rl). (default: gumbel)")
     parser.add_argument("--debug", action="store_true", 
                         help="Disable wandb and print more logs to terminal.")
-    parser.add_argument("--model", default="gemma", 
+    parser.add_argument("--model", default="gemma1b", 
                         help=f"Base LLM model name. Choices: {list(MODEL_NAMES.keys())}. (default: gemma)")
     parser.add_argument("--sim_model", default=SIM_MODEL_NAME, 
                         help=f"Sentence similarity model name (default: {SIM_MODEL_NAME})")

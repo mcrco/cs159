@@ -1,36 +1,15 @@
 import torch
-from transformers.models.auto.tokenization_auto import AutoTokenizer
+from unsloth import FastLanguageModel
+from unsloth.chat_templates import get_chat_template
 from transformers.optimization import get_linear_schedule_with_warmup
 from sentence_transformers import SentenceTransformer, util
 import wandb
 from tqdm import tqdm
-from unsloth import FastLanguageModel
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-INSTRUCTION = """
-### 
-You are a specialized steganography language model.
 
-When you are given buffer text, a single sentence, with [ENCODE] in front and a hidden bit, you will somehow modify the buffer text to encode that bit.
-However, you will not tell the user how. You simply modify the buffer text to make it work, and then write out the buffer text after the arrow. 
-For example, if you are given the prompt
-
-[ENCODE] 
-Buffer: "{buffer text}" 
-Hide bit: 1
-
-You will output a modified version of just {buffer text}, still a sentence, that somehow has encoded the bit 1 into its meaning.
-
-When you are given encoded text with [DECODE] in front, you will somehow predict the hidden bit you encoded.
-Once again, you do not say how you did it. You simply output a single bit. 
-For example, if you are given the prompt
-
-[DECODE] Encoded: "{encoded text}"
-Hide bit:
-
-You will output 0 if you think the encoded sentence is encoding 0, and 1 if you think the encoded sentences is encoding 1.
-###
-"""
+with open("prompt.txt", "r") as f:
+    INSTRUCTION = f.read()
 
 
 class GumbelSteganographer:
@@ -43,10 +22,13 @@ class GumbelSteganographer:
             dtype = None,
             load_in_4bit = True,
             device_map = "auto",
-            trust_remote_code = True,
         )
+        if 'llama' in llm_model_name:
+            self.tokenizer = get_chat_template(self.tokenizer, "llama-3.1")
+        if 'qwen' in llm_model_name:
+            self.tokenizer = get_chat_template(self.tokenizer, "qwen-2.5")
         self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = FastLanguageModel.get_peft_model(
+        self.model, self.toknizer = FastLanguageModel.get_peft_model(
             self.model,
             **lora_config,
         )
@@ -152,7 +134,11 @@ class GumbelSteganographer:
                 )
 
                 # Pass inputs_embeds and the combined attention_mask
-                logits_dec = self.model(inputs_embeds=full_embeds, attention_mask=combined_attention_mask).logits  # [B, L, V]
+                # Ensure full_embeds has the same dtype as the model's computation dtype
+                logits_dec = self.model(
+                    inputs_embeds=full_embeds.to(self.model.dtype),
+                    attention_mask=combined_attention_mask
+                ).logits  # [B, L, V]
 
                 # Extract logits for the very last token position using the combined mask info (sum along dim=1 gives sequence lengths)
                 # This part seems overly complex and potentially incorrect for getting the single bit logit.

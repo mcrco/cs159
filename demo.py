@@ -1,70 +1,61 @@
+from unsloth import FastLanguageModel
+from unsloth.chat_templates import get_chat_template
 import argparse
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 MODEL_NAMES = {
-    "llama": "meta-llama/Llama-3.2-3B-Instruct",
-    "llama8b": "meta-llama/Llama-3.1-8B-Instruct",
-    "gemma": "google/gemma-3-4b-it",
-    "olmo": "allenai/OLMo-2-0425-1B-Instruct",
-    "qwen": "Qwen/Qwen3-0.6B",
+    "llama": "unsloth/Llama-3.2-3B-Instruct",
+    "gemma": "unsloth/gemma-3-4b-it",
+    "gemma1b": "unsloth/gemma-3-1b-it",
+    "olmo": "unsloth/OLMo-2-0425-1B-Instruct",
+    "qwen": "unsloth/Qwen2.5-3B-Instruct",
+    "qwen1.5b": "unsloth/Qwen2.5-1.5B-Instruct",
+    "llama1b": "unsloth/Llama-3.2-1B-Instruct",
 }
 
-INSTRUCTION = """
-### 
-You are a specialized steganography language model.
-
-When you are given buffer text, a single sentence, with [ENCODE] in front and a hidden bit, you will somehow modify the buffer text to encode that bit.
-However, you will not tell the user how. You simply modify the buffer text to make it work, and then write out the buffer text. 
-For example, if you are given the pattern
-
-[ENCODE] 
-Buffer: "{buffer text}" 
-Hide bit: 1
-
-You will output a modified version of just {buffer text}, still a grammatically correct and semantically similar sentence, that somehow has encoded the bit 1 into its meaning.
-
-When you are given encoded text with [DECODE] in front, you will somehow predict the hidden bit you encoded.
-Once again, you do not say how you did it. You simply output a single bit. 
-For example, if you are given the pattern
-
-[DECODE] Encoded: "{encoded text}"
-Hide bit:
-
-You will output 0 if you think the encoded sentence is encoding 0, and 1 if you think the encoded sentences is encoding 1.
-###
-"""
+with open("prompt.txt", "r") as f:
+    INSTRUCTION = f.read()
 
 def load_model_for_demo(base_model_arg, lora_adapter_path):
     """Loads the base model, applies LoRA adapter, and returns model and tokenizer."""
     resolved_base_model_path = MODEL_NAMES.get(base_model_arg, base_model_arg)
     
-    print(f"Loading tokenizer for {resolved_base_model_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(resolved_base_model_path, trust_remote_code=True)
+    print(f"Loading model and tokenizer for {resolved_base_model_path} using Unsloth...")
+    # Using Unsloth's FastLanguageModel for loading
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=resolved_base_model_path,
+        max_seq_length=4096,  # A common default, can be made configurable
+        dtype=None,  # Unsloth will choose the optimal dtype (e.g., bfloat16, float16)
+        load_in_4bit=True,  # Enable 4-bit quantization for efficiency
+        # trust_remote_code=True,
+        # token=None, # Add HF token if dealing with gated models explicitly, or set HUGGING_FACE_HUB_TOKEN
+    )
+
+    if 'llama' in resolved_base_model_path:
+        tokenizer = get_chat_template(tokenizer, "llama-3.1")
+    if 'qwen' in resolved_base_model_path:
+        tokenizer = get_chat_template(tokenizer, "qwen-2.5")
+
     if tokenizer.pad_token is None:
         print("Tokenizer does not have a pad_token, setting it to eos_token.")
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"Loading base model {resolved_base_model_path}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        resolved_base_model_path,
-        device_map="auto",  # Automatically places model on available device(s)
-        # load_in_8bit=True,  # Load in 8-bit for efficiency
-        trust_remote_code=True
-    )
-
+    # Base model is loaded. If LoRA adapter path is provided, apply it.
+    # PeftModel.from_pretrained should work with Unsloth's base model.
     if lora_adapter_path:
         print(f"Loading LoRA adapter from {lora_adapter_path}...")
         model = PeftModel.from_pretrained(model, lora_adapter_path)
-        print(f"Model {resolved_base_model_path} with LoRA adapter from {lora_adapter_path} loaded.")
+        print(f"Model {resolved_base_model_path} with LoRA adapter from {lora_adapter_path} loaded with Unsloth.")
     else:
-        print(f"Base model {resolved_base_model_path} loaded without LoRA adapter.")
+        print(f"Base model {resolved_base_model_path} loaded with Unsloth without LoRA adapter.")
 
     # Optional: Merge LoRA layers with the base model for faster inference.
     # This makes the model no longer a PeftModel, but a standard HF model with merged weights.
+    # Note: Unsloth models are already optimized for speed.
+    # Merging with Unsloth might follow a different pattern if needed for export, e.g., model.save_pretrained_merged(...).
     # if lora_adapter_path: # Only try to merge if LoRA was loaded
     #     print("Merging LoRA adapter into the base model...")
     #     model = model.merge_and_unload()
@@ -76,6 +67,7 @@ def load_model_for_demo(base_model_arg, lora_adapter_path):
     # For operations, inputs should be moved to the device of the specific module they interact with.
     # However, model.generate() usually handles internal device placement correctly.
     # We'll move tokenized inputs to model.device, which usually refers to the device of the first parameter.
+    # Unsloth models also have a .device attribute.
     print(f"Model is primarily on device: {model.device}")
     return model, tokenizer
 
@@ -123,7 +115,7 @@ def run_encode(model, tokenizer):
 def run_decode(model, tokenizer):
     """Handles the decoding process in the demo."""
     encoded_text = input("Enter the encoded sentence to decode: ")
-    prompt_content = f'{INSTRUCTION}\n[DECODE] Encoded: "{encoded_text}"\nHide bit:\n'
+    prompt_content = f'{INSTRUCTION}\n[DECODE] Encoded: "{encoded_text}"\n'
 
     messages = [{"role": "user", "content": prompt_content}]
     input_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt", enable_thinking=False).to(model.device)
@@ -174,7 +166,7 @@ def run_example(model, tokenizer):
 
 def main_demo():
     parser = argparse.ArgumentParser(description="Interactive demo for steganography model.")
-    parser.add_argument("--base_model_name_or_path", type=str, default="gemma",
+    parser.add_argument("--model", type=str, default="llama1b",
                         help="Identifier for the base LLM (e.g., 'gemma', 'llama', 'olmo', or a HF path).")
     parser.add_argument("--lora_adapter_path", type=str, default=None,
                         help="Optional path to the trained LoRA adapter directory (e.g., ./stego_model_gumbel_llama_final).")
@@ -182,7 +174,7 @@ def main_demo():
     args = parser.parse_args()
 
     try:
-        model, tokenizer = load_model_for_demo(args.base_model_name_or_path, args.lora_adapter_path)
+        model, tokenizer = load_model_for_demo(args.model, args.lora_adapter_path)
     except Exception as e:
         print(f"Error loading model: {e}")
         print("Please ensure you have provided correct paths and have necessary libraries installed (e.g., bitsandbytes for 8-bit loading).")

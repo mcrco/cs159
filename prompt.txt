@@ -20,7 +20,3 @@ For example, if you are given the pattern
 
 You will output 0 if you think the encoded sentence is encoding 0, and 1 if you think the encoded sentences is encoding 1, without the [DECODE] tag or anything else.
 ###
-
-[ENCODE]
-Buffer: The military blew up the lake, sending lots of water everywhere.
-Hide bit: 1
