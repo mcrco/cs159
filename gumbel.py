@@ -91,18 +91,19 @@ class GumbelSteganographer:
             for buffers, bits in tqdm(train_loader, desc=f"Epoch {epoch}"):
                 global_step += 1
                 # --- Encode prompts ---
-                prompts = [
-                    f'{INSTRUCTION}\n[ENCODE]\nBuffer: "{b}"\nHide bit: {bit}\n'
+                list_of_encode_conversations = [
+                    [{"role": "user", "content": f'{INSTRUCTION}\\n[ENCODE]\\nBuffer: "{b}"\\nHide bit: {bit}\\n'}]
                     for b, bit in zip(buffers, bits.tolist())
                 ]
-                chat_prompts = [    
-                    {"role": "user", "content": p}
-                    for p in prompts
-                ]
-                enc_inputs = [self.tokenizer(
-                    p, padding=True, truncation=True, return_tensors="pt"
-                ).to(DEVICE) for p in chat_prompts]
-                logits_enc = self.model(**enc_inputs).logits  # [B, L_enc, V]
+                enc_inputs_dict = self.tokenizer.apply_chat_template(
+                    list_of_encode_conversations,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                    add_generation_prompt=True,
+                    enable_thinking=False
+                ).to(DEVICE)
+                logits_enc = self.model(enc_inputs_dict).logits  # [B, L_enc, V]
 
                 # Sample soft distributions for ALL positions
                 soft_dists = self.gumbel_softmax_sample(logits_enc)  # [B, L_enc, V]
@@ -119,15 +120,22 @@ class GumbelSteganographer:
                 )
 
                 # --- Decode prompts for classification ---
-                dec_prompts = [
-                    f'{INSTRUCTION}\n[DECODE]\nEncoded: "{t}"\n'
+                # dec_texts are the hard-decoded outputs from the encoder stage
+                list_of_decode_conversations = [
+                    [{"role": "user", "content": f'{INSTRUCTION}\\n[DECODE]\\nEncoded: "{t}"\\nHide bit:\\n'}] # Ensure prompt ends correctly
                     for t in dec_texts
                 ]
-                dec_inputs = self.tokenizer(
-                    dec_prompts, padding=True, truncation=True, return_tensors="pt"
+                dec_inputs_dict = self.tokenizer.apply_chat_template(
+                    list_of_decode_conversations,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                    add_generation_prompt=True, # Important for the model to expect to generate/predict
+                    enable_thinking=False
                 ).to(DEVICE)
+
                 prompt_embeds = self.model.get_input_embeddings()(
-                    dec_inputs.input_ids
+                    dec_inputs_dict.input_ids  # Use batched input_ids
                 )  # [B, L_dec, D]
                 # Attach entire soft_embs sequence
                 full_embeds = torch.cat(
@@ -142,9 +150,11 @@ class GumbelSteganographer:
 
                 # --- Generate 1 token sample for logging ---
                 generated = self.model.generate(
-                    input_ids=dec_inputs.input_ids, max_new_tokens=1, do_sample=False
+                    input_ids=dec_inputs_dict.input_ids, # Use batched input_ids from dec_inputs_dict
+                    attention_mask=dec_inputs_dict.attention_mask, # Add attention_mask
+                    max_new_tokens=1, do_sample=False, temperature=None, top_p=None, top_k=None, pad_token_id=self.tokenizer.eos_token_id
                 )
-                gen_token = generated[:, dec_inputs.input_ids.shape[1] :]
+                gen_token = generated[:, dec_inputs_dict.input_ids.shape[1] :] # Use dec_inputs_dict here too
                 gen_texts = self.tokenizer.batch_decode(
                     gen_token, skip_special_tokens=True
                 )
