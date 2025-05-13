@@ -213,30 +213,55 @@ class GumbelSteganographer:
             self.model.eval()
             for buf in buffers:
                 # Encode
-                encode_prompt = f'{INSTRUCTION}\n[ENCODE] Buffer: "{buf}"\nHide bit: 1\n→'
-                encode_in_ids = self.tokenizer(encode_prompt, return_tensors="pt").input_ids.to(
-                    DEVICE
-                )
+                encode_prompt_content = f'{INSTRUCTION}\\n[ENCODE] Buffer: "{buf}"\\nHide bit: 1\\n' # Assume bit 1 for validation example
+                encode_messages = [{"role": "user", "content": encode_prompt_content}]
+                encode_input_ids = self.tokenizer.apply_chat_template(
+                    encode_messages, add_generation_prompt=True, return_tensors="pt", enable_thinking=False
+                ).to(DEVICE)
+                # Removed attention_mask=None as generate usually handles it
+
                 generated_ids = self.model.generate(
-                    input_ids=encode_in_ids, max_new_tokens=20, do_sample=False
+                    input_ids=encode_input_ids,
+                    max_new_tokens=20, # Keep original validation max_new_tokens
+                    do_sample=False,
+                    temperature=None,
+                    top_p=None,
+                    top_k=None,
+                    pad_token_id=self.tokenizer.eos_token_id # Add pad_token_id for consistency
                 )
-                # Slice off prompt
+                # Slice off prompt using input_ids length from chat template
                 encoded_text = self.tokenizer.decode(
-                    generated_ids[0][encode_in_ids.shape[1] :], skip_special_tokens=True
-                )
+                    generated_ids[0][encode_input_ids.shape[1] :], skip_special_tokens=True
+                ).strip() # Add strip() for cleaner output
 
                 # Decode
-                decode_prompt = f'{INSTRUCTION}\n[DECODE] Encoded: "{encoded_text}"\nHide bit:\n'
-                decode_in_ids = self.tokenizer(decode_prompt, return_tensors="pt").input_ids.to(DEVICE)
+                decode_prompt_content = f'{INSTRUCTION}\\n[DECODE] Encoded: "{encoded_text}"\\nHide bit:\\n'
+                decode_messages = [{"role": "user", "content": decode_prompt_content}]
+                decode_input_ids = self.tokenizer.apply_chat_template(
+                    decode_messages, add_generation_prompt=True, return_tensors="pt", enable_thinking=False
+                ).to(DEVICE)
+                # Removed attention_mask=None
+
                 # Generate only the bit token
                 decoded_ids = self.model.generate(
-                    input_ids=decode_in_ids, max_new_tokens=1, do_sample=False
+                    input_ids=decode_input_ids,
+                    max_new_tokens=1,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.eos_token_id # Add pad_token_id
                 )
-                # Get the generated token (the predicted bit)
-                predicted_bit_token_id = decoded_ids[0][-1].item()
+                # Get the generated token (the predicted bit) by slicing based on input_ids length
+                predicted_bit_text = self.tokenizer.decode(
+                    decoded_ids[0][decode_input_ids.shape[1]:], skip_special_tokens=True
+                ).strip() # Add strip()
 
-                predicted_bit = "0" if predicted_bit_token_id == zero_id else "1" if predicted_bit_token_id == one_id else "UNK"
+                # Determine predicted bit based on the decoded text
+                predicted_bit = "UNK" # Default to UNK
+                if predicted_bit_text == "0":
+                    predicted_bit = "0"
+                elif predicted_bit_text == "1":
+                    predicted_bit = "1"
 
+                # Logging remains the same
                 if not self.debug:
                     table.add_data(buf, encoded_text, predicted_bit)
                 else:
