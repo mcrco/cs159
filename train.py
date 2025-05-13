@@ -10,7 +10,8 @@ MODEL_NAMES = {
     "gemma": "unsloth/gemma-3-4b-it",
     "gemma1b": "unsloth/gemma-3-1b-it",
     "olmo": "unsloth/OLMo-2-0425-1B-Instruct",
-    "qwen": "unsloth/Qwen2.5-3B-Instruct",
+    "qwen7b": "unsloth/Qwen2.5-7B-Instruct",
+    "qwen3b": "unsloth/Qwen2.5-3B-Instruct",
     "qwen1.5b": "unsloth/Qwen2.5-1.5B-Instruct",
     "llama1b": "unsloth/Llama-3.2-1B-Instruct",
 }
