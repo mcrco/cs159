@@ -101,7 +101,8 @@ class GumbelSteganographer:
                     truncation=True,
                     return_tensors="pt",
                     add_generation_prompt=True,
-                    enable_thinking=False
+                    enable_thinking=False,
+                    return_dict=True
                 ).to(DEVICE)
                 logits_enc = self.model(**enc_inputs_dict).logits  # [B, L_enc, V]
 
@@ -131,7 +132,8 @@ class GumbelSteganographer:
                     truncation=True,
                     return_tensors="pt",
                     add_generation_prompt=True, # Important for the model to expect to generate/predict
-                    enable_thinking=False
+                    enable_thinking=False,
+                    return_dict=True
                 ).to(DEVICE)
 
                 # Access input_ids using dictionary key
