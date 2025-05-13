@@ -82,14 +82,13 @@ def main():
     )
 
     # --- PEFT Configuration ---
-    peft_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=args.lora_target_modules,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-    )
+    peft_config = {
+        "r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "target_modules": args.lora_target_modules,
+        "lora_dropout": args.lora_dropout,
+        "bias": "none",
+    }
 
     # --- Model Instantiation ---
     llm_model_path = MODEL_NAMES.get(args.model, args.model) # Allow custom paths if not in MODEL_NAMES

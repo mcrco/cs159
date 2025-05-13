@@ -1,11 +1,10 @@
 import torch
-from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from transformers.optimization import get_linear_schedule_with_warmup
-from peft import get_peft_model
 from sentence_transformers import SentenceTransformer, util
 import wandb
 from tqdm import tqdm
+from unsloth import FastLanguageModel
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 INSTRUCTION = """
@@ -38,15 +37,19 @@ class GumbelSteganographer:
     def __init__(
         self, llm_model_name, sim_model_name, lora_config, temperature, lambda_sim, debug=False, optimizer_args=None, scheduler_args=None
     ) -> None:
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            llm_model_name, trust_remote_code=True
+        self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+            model_name = llm_model_name,
+            max_seq_length = 2048,
+            dtype = None,
+            load_in_4bit = True,
+            device_map = "auto",
+            trust_remote_code = True,
         )
         self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = AutoModelForCausalLM.from_pretrained(
-            llm_model_name, device_map="auto", load_in_8bit=True, trust_remote_code=True
+        self.model = FastLanguageModel.get_peft_model(
+            self.model,
+            **lora_config,
         )
-        self.model = get_peft_model(self.model, lora_config)
-        self.model.to(DEVICE)
         self.sim_model = SentenceTransformer(sim_model_name)
 
         self.temperature = float(temperature)
@@ -98,7 +101,6 @@ class GumbelSteganographer:
                 enc_inputs_dict = self.tokenizer.apply_chat_template(
                     list_of_encode_conversations,
                     padding=True,
-                    truncation=True,
                     return_tensors="pt",
                     add_generation_prompt=True,
                     enable_thinking=False,
@@ -129,7 +131,6 @@ class GumbelSteganographer:
                 dec_inputs_dict = self.tokenizer.apply_chat_template(
                     list_of_decode_conversations,
                     padding=True,
-                    truncation=True,
                     return_tensors="pt",
                     add_generation_prompt=True, # Important for the model to expect to generate/predict
                     enable_thinking=False,

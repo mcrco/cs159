@@ -14,5 +14,6 @@ dependencies = [
     "peft>=0.15.2",
     "sentence-transformers>=4.1.0",
     "transformers>=4.51.3",
+    "unsloth>=2025.5.1",
     "wandb>=0.19.10",
 ]
