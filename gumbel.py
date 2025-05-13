@@ -103,7 +103,7 @@ class GumbelSteganographer:
                     add_generation_prompt=True,
                     enable_thinking=False
                 ).to(DEVICE)
-                logits_enc = self.model(enc_inputs_dict).logits  # [B, L_enc, V]
+                logits_enc = self.model(**enc_inputs_dict).logits  # [B, L_enc, V]
 
                 # Sample soft distributions for ALL positions
                 soft_dists = self.gumbel_softmax_sample(logits_enc)  # [B, L_enc, V]
@@ -134,27 +134,49 @@ class GumbelSteganographer:
                     enable_thinking=False
                 ).to(DEVICE)
 
+                # Access input_ids using dictionary key
                 prompt_embeds = self.model.get_input_embeddings()(
-                    dec_inputs_dict.input_ids  # Use batched input_ids
+                    dec_inputs_dict['input_ids']
                 )  # [B, L_dec, D]
                 # Attach entire soft_embs sequence
                 full_embeds = torch.cat(
                     [prompt_embeds, soft_embs], dim=1
                 )  # [B, L_dec+L_enc, D]
 
-                logits_dec = self.model(inputs_embeds=full_embeds).logits  # [B, L, V]
-                bit_logits = logits_dec[:, -1, [zero_id, one_id]]
+                # Construct the combined attention mask
+                combined_attention_mask = torch.cat(
+                    [dec_inputs_dict['attention_mask'], enc_inputs_dict['attention_mask']], dim=1
+                )
+
+                # Pass inputs_embeds and the combined attention_mask
+                logits_dec = self.model(inputs_embeds=full_embeds, attention_mask=combined_attention_mask).logits  # [B, L, V]
+
+                # Extract logits for the very last token position using the combined mask info (sum along dim=1 gives sequence lengths)
+                # This part seems overly complex and potentially incorrect for getting the single bit logit.
+                # Let's simplify: The bit prediction should correspond to the FIRST token generated AFTER the decode prompt.
+                # The prompt ends with "Hide bit:\n", so we want the logits for the token immediately after that.
+                # The position should be the sequence length of the *decoder prompt* part.
+                sequence_lengths = dec_inputs_dict['attention_mask'].sum(dim=1) # Lengths of decoder prompts [B]
+                # Gather the logits at the end of each decoder prompt sequence
+                # Use gather index: shape [B, 1, 2] for [zero_id, one_id]
+                gather_index = sequence_lengths.view(-1, 1, 1).expand(-1, 1, 2)
+                # We need logits from the position *before* the gather index corresponds to the *last* token *of the prompt*
+                # So we need the logits at index sequence_lengths - 1
+                bit_logits = torch.gather(logits_dec[:, :, [zero_id, one_id]], 1, gather_index - 1).squeeze(1)
+                # OLD way: bit_logits = logits_dec[:, -1, [zero_id, one_id]] # This assumed the bit was always the very last token overall
+
                 loss_bit = torch.nn.functional.cross_entropy(
                     bit_logits, bits.to(DEVICE)
                 )
 
                 # --- Generate 1 token sample for logging ---
+                # Ensure generate call uses dictionary unpacking or correct keywords
                 generated = self.model.generate(
-                    input_ids=dec_inputs_dict.input_ids, # Use batched input_ids from dec_inputs_dict
-                    attention_mask=dec_inputs_dict.attention_mask, # Add attention_mask
+                    input_ids=dec_inputs_dict['input_ids'], # Use key access
+                    attention_mask=dec_inputs_dict['attention_mask'], # Use key access
                     max_new_tokens=1, do_sample=False, temperature=None, top_p=None, top_k=None, pad_token_id=self.tokenizer.eos_token_id
                 )
-                gen_token = generated[:, dec_inputs_dict.input_ids.shape[1] :] # Use dec_inputs_dict here too
+                gen_token = generated[:, dec_inputs_dict['input_ids'].shape[1] :] # Use key access
                 gen_texts = self.tokenizer.batch_decode(
                     gen_token, skip_special_tokens=True
                 )
