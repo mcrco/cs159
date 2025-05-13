@@ -27,8 +27,8 @@ def main():
                         help="Method to use for steganography (gumbel or rl). (default: gumbel)")
     parser.add_argument("--debug", action="store_true", 
                         help="Disable wandb and print more logs to terminal.")
-    parser.add_argument("--model", default="gemma1b", 
-                        help=f"Base LLM model name. Choices: {list(MODEL_NAMES.keys())}. (default: gemma)")
+    parser.add_argument("--model", default="qwen", 
+                        help=f"Base LLM model name. Choices: {list(MODEL_NAMES.keys())}. (default: qwen)")
     parser.add_argument("--sim_model", default=SIM_MODEL_NAME, 
                         help=f"Sentence similarity model name (default: {SIM_MODEL_NAME})")
     parser.add_argument("--temp", type=float, default=1.0, 

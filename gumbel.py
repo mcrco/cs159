@@ -23,16 +23,28 @@ class GumbelSteganographer:
             load_in_4bit = True,
             device_map = "auto",
         )
-        if 'llama' in llm_model_name:
-            self.tokenizer = get_chat_template(self.tokenizer, "llama-3.1")
-        if 'qwen' in llm_model_name:
-            self.tokenizer = get_chat_template(self.tokenizer, "qwen-2.5")
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model, self.toknizer = FastLanguageModel.get_peft_model(
+
+        if 'llama' in llm_model_name.lower():
+            self.tokenizer = get_chat_template(self.tokenizer, chat_template="llama-3.1")
+        elif 'qwen' in llm_model_name.lower():
+            self.tokenizer = get_chat_template(self.tokenizer, chat_template="qwen-2.5")
+        elif 'gemma' in llm_model_name.lower():
+            self.tokenizer = get_chat_template(self.tokenizer, chat_template="gemma-3")
+        elif 'olmo' in llm_model_name.lower():
+            self.tokenizer = get_chat_template(self.tokenizer, chat_template="olmo")
+
+        if self.tokenizer.pad_token is None:
+            print("Tokenizer does not have a pad_token, setting it to eos_token.")
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            if self.model.config.pad_token_id is None: # Also set model config pad_token_id
+                 self.model.config.pad_token_id = self.tokenizer.eos_token_id
+
+
+        self.model = FastLanguageModel.get_peft_model(
             self.model,
             **lora_config,
         )
-        self.sim_model = SentenceTransformer(sim_model_name)
+        self.sim_model = SentenceTransformer(sim_model_name, device=DEVICE)
 
         self.temperature = float(temperature)
         self.lambda_sim = float(lambda_sim)
@@ -40,6 +52,18 @@ class GumbelSteganographer:
 
         self.optimizer_args = optimizer_args if optimizer_args else {'lr': 1e-4}
         self.scheduler_args = scheduler_args if scheduler_args else {'num_warmup_steps': 500}
+        
+        self.zero_id = self.tokenizer.convert_tokens_to_ids("0")
+        self.one_id = self.tokenizer.convert_tokens_to_ids("1")
+        # Ensure they are single IDs if tokenizer returns lists
+        if isinstance(self.zero_id, list): self.zero_id = self.zero_id[0]
+        if isinstance(self.one_id, list): self.one_id = self.one_id[0]
+
+        self.default_generation_params = {
+            "do_sample": False, "temperature": None, "top_p": None, "top_k": None, 
+            "pad_token_id": self.tokenizer.pad_token_id # Use actual pad_token_id from tokenizer
+        }
+        self.generation_length_margin = 10
 
     @staticmethod
     def sample_gumbel(shape, device, eps=1e-20):
@@ -53,6 +77,176 @@ class GumbelSteganographer:
         y = torch.softmax((logits + gumbel_noise) / self.temperature, dim=-1)
         return y
 
+    def _prepare_encode_prompts(self, buffers: list[str], bits_to_hide: list[int]) -> list[list[dict]]:
+        return [
+            [{"role": "user", "content": f'{INSTRUCTION}\\n[ENCODE]\\nBuffer: {b}\\nHide bit: {bit}\\n'}]
+            for b, bit in zip(buffers, bits_to_hide)
+        ]
+
+    def _prepare_decode_prompts(self, encoded_texts: list[str]) -> list[list[dict]]:
+        # This prompt structure (ending with \nEncoded:"{text}"\n) is used for both 
+        # training (bit_logits extraction) and inference (generating the bit).
+        # add_generation_prompt=True in apply_chat_template prepares the model to generate after this.
+        return [
+            [{"role": "user", "content": f'{INSTRUCTION}\\n[DECODE]\\nEncoded: {text}\\n'}]
+            for text in encoded_texts
+        ]
+
+    def generate_encoded_text_or_embeddings(
+        self, 
+        buffers: str | list[str], 
+        bits_to_hide: int | list[int], 
+        produce_embeddings: bool,
+        generation_max_new_tokens: int | None = None 
+    ):
+        was_single_input = isinstance(buffers, str)
+        
+        _buffers = [buffers] if was_single_input else buffers
+        
+        if isinstance(bits_to_hide, int):
+            _bits_to_hide = [bits_to_hide] * len(_buffers)
+        elif bits_to_hide is not None and len(bits_to_hide) != len(_buffers):
+            raise ValueError("Buffers and bits_to_hide must have the same number of elements if bits_to_hide is a list.")
+        else:
+            _bits_to_hide = bits_to_hide
+
+        # Calculate dynamic generation length based on buffer contents
+        if not _buffers:
+            # Fallback if somehow _buffers is empty, though input validation should prevent this.
+            # Using a small fixed number or generation_length_margin itself.
+            max_buffer_token_count = 0
+        else:
+            buffer_token_lengths = [len(self.tokenizer.tokenize(b)) for b in _buffers]
+            max_buffer_token_count = max(buffer_token_lengths) if buffer_token_lengths else 0
+        
+        dynamic_generation_length = max(5, max_buffer_token_count + self.generation_length_margin) # Ensure min 5 tokens
+
+        list_of_encode_conversations = self._prepare_encode_prompts(_buffers, _bits_to_hide)
+        
+        enc_inputs_dict = self.tokenizer.apply_chat_template(
+            list_of_encode_conversations,
+            padding=True, return_tensors="pt", add_generation_prompt=True, enable_thinking=False, return_dict=True
+        ).to(self.model.device)
+
+        if produce_embeddings:
+            # Perform auto-regressive generation with Gumbel-Softmax
+            batch_size = enc_inputs_dict['input_ids'].size(0)
+            current_input_ids = enc_inputs_dict['input_ids']
+            current_attention_mask = enc_inputs_dict['attention_mask']
+            
+            emb_matrix = self.model.get_input_embeddings().weight
+            
+            list_generated_soft_embs = []
+            list_generated_hard_ids = []
+            
+            # Use a fixed length for generated sequence in training, e.g., default_val_encode_max_new_tokens
+            num_tokens_to_generate = dynamic_generation_length
+
+            for _ in range(num_tokens_to_generate):
+                model_outputs = self.model(input_ids=current_input_ids, attention_mask=current_attention_mask)
+                next_token_logits = model_outputs.logits[:, -1, :]  # Logits for the next token
+
+                soft_dist = self.gumbel_softmax_sample(next_token_logits) # [B, V]
+                
+                # Soft embedding for this step
+                # Unsqueeze soft_dist to [B, 1, V] for matmul with emb_matrix [V, D] -> [B, 1, D]
+                current_soft_emb = torch.matmul(soft_dist.unsqueeze(1).to(emb_matrix.dtype), emb_matrix) # [B, 1, D]
+                list_generated_soft_embs.append(current_soft_emb)
+                
+                # Hard token for this step (to be fed into the next step of generation)
+                hard_id = torch.argmax(soft_dist, dim=-1).unsqueeze(1)  # [B, 1]
+                list_generated_hard_ids.append(hard_id)
+                
+                # Append the generated hard_id for the next iteration
+                current_input_ids = torch.cat([current_input_ids, hard_id], dim=1)
+                current_attention_mask = torch.cat([current_attention_mask, torch.ones_like(hard_id)], dim=1)
+
+            # Concatenate collected tensors
+            # final_soft_embs: [B, num_tokens_to_generate, D]
+            final_soft_embs = torch.cat(list_generated_soft_embs, dim=1) 
+            # final_hard_ids: [B, num_tokens_to_generate]
+            final_hard_ids = torch.cat(list_generated_hard_ids, dim=1)
+            
+            intermediate_encoded_texts = self.tokenizer.batch_decode(final_hard_ids, skip_special_tokens=True)
+            
+            # The attention mask for these generated soft embeddings
+            # Shape: [B, num_tokens_to_generate]
+            generated_attention_mask = torch.ones_like(final_hard_ids, device=self.model.device)
+            
+            return final_soft_embs, intermediate_encoded_texts, generated_attention_mask
+        else:
+            # Inference path remains the same
+            if generation_max_new_tokens is not None:
+                max_tokens = generation_max_new_tokens
+            else:
+                max_tokens = dynamic_generation_length
+            generated_ids = self.model.generate(
+                input_ids=enc_inputs_dict['input_ids'],
+                attention_mask=enc_inputs_dict['attention_mask'],
+                max_new_tokens=max_tokens,
+                **self.default_generation_params
+            )
+            encoded_texts_generated = self.tokenizer.batch_decode(
+                generated_ids[:, enc_inputs_dict['input_ids'].shape[1]:], skip_special_tokens=True
+            )
+            stripped_texts = [text.strip() for text in encoded_texts_generated]
+            return stripped_texts[0] if was_single_input else stripped_texts
+
+    def predict_bits_from_encoded_text(
+        self, 
+        encoded_texts: str | list[str], 
+        soft_embs_from_encoder: torch.Tensor | None = None, 
+        attention_mask_for_soft_embs: torch.Tensor | None = None
+    ):
+        was_single_input = isinstance(encoded_texts, str)
+        _encoded_texts = [encoded_texts] if was_single_input else encoded_texts
+
+        list_of_decode_conversations = self._prepare_decode_prompts(_encoded_texts)
+        
+        dec_inputs_dict = self.tokenizer.apply_chat_template(
+            list_of_decode_conversations,
+            padding=True, return_tensors="pt", add_generation_prompt=True, enable_thinking=False, return_dict=True
+        ).to(self.model.device)
+
+        if soft_embs_from_encoder is not None: # Training path, returns bit_logits
+            if attention_mask_for_soft_embs is None:
+                raise ValueError("attention_mask_for_soft_embs must be provided if soft_embs_from_encoder is given.")
+
+            prompt_embeds = self.model.get_input_embeddings()(dec_inputs_dict['input_ids'])
+            _soft_embs = soft_embs_from_encoder.to(device=prompt_embeds.device, dtype=prompt_embeds.dtype)
+            _attn_mask_soft_embs = attention_mask_for_soft_embs.to(device=prompt_embeds.device)
+
+            full_embeds = torch.cat([prompt_embeds, _soft_embs], dim=1)
+            combined_attention_mask = torch.cat([dec_inputs_dict['attention_mask'], _attn_mask_soft_embs], dim=1)
+            
+            logits_dec = self.model(
+                inputs_embeds=full_embeds,
+                attention_mask=combined_attention_mask
+            ).logits
+
+            sequence_lengths = dec_inputs_dict['attention_mask'].sum(dim=1) # Lengths of decoder prompts [B]
+            # Logits for the token to be generated immediately after the decoder prompt.
+            # sequence_lengths are 1-based. Index is sequence_lengths - 1 for the last token of the prompt.
+            # The model's output at this position (logits_dec[b, seq_len-1, :]) is used to predict the *next* token.
+            batch_indices = torch.arange(logits_dec.size(0), device=logits_dec.device)
+            last_prompt_token_logits = logits_dec[batch_indices, sequence_lengths - 1]
+            bit_logits = last_prompt_token_logits[:, [self.zero_id, self.one_id]]
+            
+            # Returns batched tensor even for single input if soft_embs provided
+            return bit_logits
+        else: # Inference/validation path, returns "0" or "1" text
+            decoded_ids = self.model.generate(
+                input_ids=dec_inputs_dict['input_ids'],
+                attention_mask=dec_inputs_dict['attention_mask'],
+                max_new_tokens=1,
+                **self.default_generation_params
+            )
+            predicted_bit_texts = self.tokenizer.batch_decode(
+                decoded_ids[:, dec_inputs_dict['input_ids'].shape[1]:], skip_special_tokens=True
+            )
+            stripped_texts = [text.strip() for text in predicted_bit_texts]
+            return stripped_texts[0] if was_single_input else stripped_texts
+
     def train(self, train_loader, val_loader, num_epochs, model_save_path_prefix="./stego_lora"):
         optimizer = torch.optim.AdamW(self.model.parameters(), **self.optimizer_args)
         
@@ -61,12 +255,7 @@ class GumbelSteganographer:
         if 'num_training_steps' not in current_scheduler_args:
             current_scheduler_args['num_training_steps'] = total_steps
         
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, **current_scheduler_args
-        )
-
-        zero_id = self.tokenizer.convert_tokens_to_ids("0")
-        one_id = self.tokenizer.convert_tokens_to_ids("1")
+        scheduler = get_linear_schedule_with_warmup(optimizer, **current_scheduler_args)
         global_step = 0
 
         for epoch in range(num_epochs):
@@ -75,129 +264,54 @@ class GumbelSteganographer:
 
             for buffers, bits in tqdm(train_loader, desc=f"Epoch {epoch}"):
                 global_step += 1
-                # --- Encode prompts ---
-                list_of_encode_conversations = [
-                    [{"role": "user", "content": f'{INSTRUCTION}\\n[ENCODE]\\nBuffer: "{b}"\\nHide bit: {bit}\\n'}]
-                    for b, bit in zip(buffers, bits.tolist())
-                ]
-                enc_inputs_dict = self.tokenizer.apply_chat_template(
-                    list_of_encode_conversations,
-                    padding=True,
-                    return_tensors="pt",
-                    add_generation_prompt=True,
-                    enable_thinking=False,
-                    return_dict=True
-                ).to(DEVICE)
-                logits_enc = self.model(**enc_inputs_dict).logits  # [B, L_enc, V]
+                optimizer.zero_grad()
 
-                # Sample soft distributions for ALL positions
-                soft_dists = self.gumbel_softmax_sample(logits_enc)  # [B, L_enc, V]
-                emb_matrix = self.model.get_input_embeddings().weight  # [V, D]
-                # Convert to soft embeddings per position
-                soft_embs = torch.matmul(
-                    soft_dists.to(emb_matrix.dtype), emb_matrix
-                )  # [B, L_enc, D]
+                # --- Encode to get soft embeddings and intermediate texts ---
+                # buffers is List[str], bits is Tensor. Convert bits to list for the function.
+                current_bits_list = bits.tolist()
+                soft_embs, intermediate_encoded_texts, enc_attention_mask = \
+                    self.generate_encoded_text_or_embeddings(
+                        buffers, current_bits_list, produce_embeddings=True
+                    )
 
-                # Hard decode for logging and prompts
-                hard_ids = torch.argmax(soft_dists, dim=-1)  # [B, L_enc]
-                dec_texts = self.tokenizer.batch_decode(
-                    hard_ids, skip_special_tokens=True
+                # --- Decode using soft embeddings to get bit logits ---
+                bit_logits = self.predict_bits_from_encoded_text(
+                    intermediate_encoded_texts, # These are the "encoded" texts for the DECODE prompt
+                    soft_embs_from_encoder=soft_embs,
+                    attention_mask_for_soft_embs=enc_attention_mask
                 )
+                
+                loss_bit = torch.nn.functional.cross_entropy(bit_logits, bits.to(self.model.device))
 
-                # --- Decode prompts for classification ---
-                # dec_texts are the hard-decoded outputs from the encoder stage
-                list_of_decode_conversations = [
-                    [{"role": "user", "content": f'{INSTRUCTION}\\n[DECODE]\\nEncoded: "{t}"\\nHide bit:\\n'}] # Ensure prompt ends correctly
-                    for t in dec_texts
-                ]
-                dec_inputs_dict = self.tokenizer.apply_chat_template(
-                    list_of_decode_conversations,
-                    padding=True,
-                    return_tensors="pt",
-                    add_generation_prompt=True, # Important for the model to expect to generate/predict
-                    enable_thinking=False,
-                    return_dict=True
-                ).to(DEVICE)
-
-                # Access input_ids using dictionary key
-                prompt_embeds = self.model.get_input_embeddings()(
-                    dec_inputs_dict['input_ids']
-                )  # [B, L_dec, D]
-                # Attach entire soft_embs sequence
-                full_embeds = torch.cat(
-                    [prompt_embeds, soft_embs], dim=1
-                )  # [B, L_dec+L_enc, D]
-
-                # Construct the combined attention mask
-                combined_attention_mask = torch.cat(
-                    [dec_inputs_dict['attention_mask'], enc_inputs_dict['attention_mask']], dim=1
-                )
-
-                # Pass inputs_embeds and the combined attention_mask
-                # Ensure full_embeds has the same dtype as the model's computation dtype
-                logits_dec = self.model(
-                    inputs_embeds=full_embeds.to(self.model.dtype),
-                    attention_mask=combined_attention_mask
-                ).logits  # [B, L, V]
-
-                # Extract logits for the very last token position using the combined mask info (sum along dim=1 gives sequence lengths)
-                # This part seems overly complex and potentially incorrect for getting the single bit logit.
-                # Let's simplify: The bit prediction should correspond to the FIRST token generated AFTER the decode prompt.
-                # The prompt ends with "Hide bit:\n", so we want the logits for the token immediately after that.
-                # The position should be the sequence length of the *decoder prompt* part.
-                sequence_lengths = dec_inputs_dict['attention_mask'].sum(dim=1) # Lengths of decoder prompts [B]
-                # Gather the logits at the end of each decoder prompt sequence
-                # Use gather index: shape [B, 1, 2] for [zero_id, one_id]
-                gather_index = sequence_lengths.view(-1, 1, 1).expand(-1, 1, 2)
-                # We need logits from the position *before* the gather index corresponds to the *last* token *of the prompt*
-                # So we need the logits at index sequence_lengths - 1
-                bit_logits = torch.gather(logits_dec[:, :, [zero_id, one_id]], 1, gather_index - 1).squeeze(1)
-                # OLD way: bit_logits = logits_dec[:, -1, [zero_id, one_id]] # This assumed the bit was always the very last token overall
-
-                loss_bit = torch.nn.functional.cross_entropy(
-                    bit_logits, bits.to(DEVICE)
-                )
-
-                # --- Generate 1 token sample for logging ---
-                # Ensure generate call uses dictionary unpacking or correct keywords
-                generated = self.model.generate(
-                    input_ids=dec_inputs_dict['input_ids'], # Use key access
-                    attention_mask=dec_inputs_dict['attention_mask'], # Use key access
-                    max_new_tokens=1, do_sample=False, temperature=None, top_p=None, top_k=None, pad_token_id=self.tokenizer.eos_token_id
-                )
-                gen_token = generated[:, dec_inputs_dict['input_ids'].shape[1] :] # Use key access
-                gen_texts = self.tokenizer.batch_decode(
-                    gen_token, skip_special_tokens=True
-                )
-
-                # Semantic similarity
-                orig_emb = self.sim_model.encode(
-                    buffers, convert_to_tensor=True, device=DEVICE
-                )
-                enc_emb = self.sim_model.encode(
-                    gen_texts, convert_to_tensor=True, device=DEVICE
-                )
+                # --- Semantic similarity loss ---
+                # Using intermediate_encoded_texts (hard Gumbel output) for similarity
+                orig_emb = self.sim_model.encode(buffers, convert_to_tensor=True) # Already on DEVICE via sim_model init
+                enc_emb = self.sim_model.encode(intermediate_encoded_texts, convert_to_tensor=True)
+                
+                # Ensure embeddings are on the same device for cos_sim if not already handled
+                # Sim_model was initialized to DEVICE, so its output should be too.
                 sim_scores = util.cos_sim(orig_emb, enc_emb).diag()
-                loss_sim = (1 - sim_scores).mean()
-
-                # Backprop
-                loss = loss_bit + self.lambda_sim * loss_sim
+                loss_sim = (1 - sim_scores).mean() # Ensure this is on model.device for loss accumulation
+                
+                loss = loss_bit + self.lambda_sim * loss_sim.to(loss_bit.device) # Ensure loss_sim is on same device
                 loss.backward()
                 optimizer.step()
                 scheduler.step()
-                self.model.zero_grad()
                 running_loss += loss.item()
 
-                if self.debug and global_step % 10 == 0: # Print every 10 steps or adjust as needed
+                # --- Logging ---
+                if self.debug and global_step % 10 == 0:
+                    # Get predicted bit text for logging (inference path of predict_bits)
+                    predicted_bits_texts_log = self.predict_bits_from_encoded_text(intermediate_encoded_texts)
+                    
                     print(f"--- Training Step {global_step} (Batch Item 0) ---")
-                    print(f'Buffer: "{buffers[0]}"')
-                    # dec_texts[0] is the hard Gumbel-Softmax decoding of the encoder's output logits for the input sequence.
-                    # This is what's used in the DECODE prompt as "Encoded: ..." during this training step.
-                    print(f'Encoded (for DECODE): "{dec_texts[0]}"')
-                    print(f"Target Bit: {bits[0].item()}")
-                    print(f"Predicted Bit (by DECODE part): {gen_texts[0]}\n")
+                    print(f'Buffer: {buffers[0]}')
+                    print(f'Encoded (for DECODE): {intermediate_encoded_texts[0]}')
+                    print(f"Target Bit: {current_bits_list[0]}")
+                    # predicted_bits_texts_log is a list, take first item
+                    print(f"Predicted Bit (by DECODE part): {predicted_bits_texts_log[0] if isinstance(predicted_bits_texts_log, list) else predicted_bits_texts_log}\n")
 
-                # Step logs
+
                 if not self.debug:
                     wandb.log(
                         {
@@ -208,7 +322,6 @@ class GumbelSteganographer:
                         step=global_step,
                     )
 
-            # Epoch logs
             avg_loss = running_loss / len(train_loader)
             if not self.debug:
                 wandb.log({"train/avg_loss": avg_loss, "epoch": epoch}, step=global_step)
@@ -217,78 +330,51 @@ class GumbelSteganographer:
 
         if not self.debug:
             final_save_path = f"{model_save_path_prefix}_final"
-            self.model.save_pretrained(final_save_path)
+            self.model.save_pretrained(final_save_path) # Unsloth PEFT model save
             self.tokenizer.save_pretrained(final_save_path)
             print(f"Model saved to {final_save_path}")
 
     def validate(self, val_loader, epoch):
         if not self.debug:
-            table = wandb.Table(columns=["buffer", "encoded_sentence", "decoded_bit"])
+            table = wandb.Table(columns=["buffer", "encoded_sentence", "decoded_bit", "target_bit"])
         else:
             print(f"--- Validation Epoch {epoch} ---")
 
-        zero_id = self.tokenizer.convert_tokens_to_ids("0")
-        one_id = self.tokenizer.convert_tokens_to_ids("1")
+        self.model.eval() # Set model to evaluation mode
 
-        for buffers, bits in tqdm(val_loader, desc=f"Epoch {epoch}"):
-            self.model.eval()
-            for buf in buffers:
-                # Encode
-                encode_prompt_content = f'{INSTRUCTION}\\n[ENCODE] Buffer: "{buf}"\\nHide bit: 1\\n' # Assume bit 1 for validation example
-                encode_messages = [{"role": "user", "content": encode_prompt_content}]
-                encode_input_ids = self.tokenizer.apply_chat_template(
-                    encode_messages, add_generation_prompt=True, return_tensors="pt", enable_thinking=False
-                ).to(DEVICE)
-                # Removed attention_mask=None as generate usually handles it
+        for buffers, bits in tqdm(val_loader, desc=f"Validating Epoch {epoch}"):
+            # Iterate through batch items for individual processing, as validate often shows examples
+            for i in range(len(buffers)):
+                buf = buffers[i]
+                target_bit_val = bits[i].item() # Target bit for this item
 
-                generated_ids = self.model.generate(
-                    input_ids=encode_input_ids,
-                    max_new_tokens=20, # Keep original validation max_new_tokens
-                    do_sample=False,
-                    temperature=None,
-                    top_p=None,
-                    top_k=None,
-                    pad_token_id=self.tokenizer.eos_token_id # Add pad_token_id for consistency
+                # Encode (using inference path of generate_encoded_text_or_embeddings)
+                # Bit to hide for validation encoding - can be fixed or use target_bit_val
+                # Using target_bit_val to see how it encodes the specific target bit.
+                encoded_text = self.generate_encoded_text_or_embeddings(
+                    buf, 
+                    target_bit_val, # Use actual bit for encoding during validation
+                    produce_embeddings=False, 
+                    generation_max_new_tokens=None # MODIFIED HERE: Allow dynamic calculation based on buffer
                 )
-                # Slice off prompt using input_ids length from chat template
-                encoded_text = self.tokenizer.decode(
-                    generated_ids[0][encode_input_ids.shape[1] :], skip_special_tokens=True
-                ).strip() # Add strip() for cleaner output
 
-                # Decode
-                decode_prompt_content = f'{INSTRUCTION}\\n[DECODE] Encoded: "{encoded_text}"\\nHide bit:\\n'
-                decode_messages = [{"role": "user", "content": decode_prompt_content}]
-                decode_input_ids = self.tokenizer.apply_chat_template(
-                    decode_messages, add_generation_prompt=True, return_tensors="pt", enable_thinking=False
-                ).to(DEVICE)
-                # Removed attention_mask=None
-
-                # Generate only the bit token
-                decoded_ids = self.model.generate(
-                    input_ids=decode_input_ids,
-                    max_new_tokens=1,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.eos_token_id # Add pad_token_id
-                )
-                # Get the generated token (the predicted bit) by slicing based on input_ids length
-                predicted_bit_text = self.tokenizer.decode(
-                    decoded_ids[0][decode_input_ids.shape[1]:], skip_special_tokens=True
-                ).strip() # Add strip()
-
-                # Determine predicted bit based on the decoded text
-                predicted_bit = "UNK" # Default to UNK
+                # Decode (using inference path of predict_bits_from_encoded_text)
+                predicted_bit_text = self.predict_bits_from_encoded_text(encoded_text)
+                
+                # Determine predicted bit category
+                processed_predicted_bit = "UNK"
                 if predicted_bit_text == "0":
-                    predicted_bit = "0"
+                    processed_predicted_bit = "0"
                 elif predicted_bit_text == "1":
-                    predicted_bit = "1"
+                    processed_predicted_bit = "1"
 
-                # Logging remains the same
                 if not self.debug:
-                    table.add_data(buf, encoded_text, predicted_bit)
+                    table.add_data(buf, encoded_text, processed_predicted_bit, str(target_bit_val))
                 else:
                     print(f'Buffer: "{buf}"')
+                    print(f'Target Bit: {target_bit_val}')
                     print(f'Encoded: "{encoded_text}"')
-                    print(f"Decoded bit: {predicted_bit}\n")
+                    print(f"Decoded bit: {processed_predicted_bit}\n")
         
         if not self.debug:
-            wandb.log({f"epoch_{epoch}_generation": table})
+            wandb.log({f"val/epoch_{epoch}_examples": table}, step=epoch) # Use epoch for val table step
