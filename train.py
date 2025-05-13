@@ -17,6 +17,13 @@ MODEL_NAMES = {
 }
 SIM_MODEL_NAME = "all-MiniLM-L6-v2"
 
+# Define available datasets and their corresponding path prefixes/suffixes
+AVAILABLE_DATASETS = {
+    "childrens_classics": "stego_dataset_childrens_classics/",
+    "wizard_of_oz": "stego_dataset_wizard_of_oz/",
+    "pride_and_prejudice": "stego_dataset_pride_and_prejudice/",
+}
+
 def collate_fn(batch):
     buffers = [item["buffer_text"] for item in batch]
     bits = torch.tensor([item["bit"] for item in batch], dtype=torch.long)
@@ -50,27 +57,29 @@ def main():
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha parameter (default: 32)")
     parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout (default: 0.1)")
     parser.add_argument("--lora_target_modules", nargs='+', default=["q_proj", "v_proj"],
-                        help="LoRA target modules (default: [\'q_proj\', \'v_proj\'])")
-    parser.add_argument("--dataset_path", type=str, default="stego_dataset_wizard_of_oz/",
-                        help="Path to the cached dataset (default: stego_dataset_wizard_of_oz/)")
+                        help="LoRA target modules (default: [\'q_proj\', \'v_proj\']")
+    parser.add_argument("--dataset_name", type=str, default="childrens_classics", 
+                        choices=list(AVAILABLE_DATASETS.keys()),
+                        help="Name of the dataset to use. (default: childrens_classics)")
     parser.add_argument("--model_save_prefix", type=str, default="./stego_model",
                         help="Prefix for saving the trained model (default: ./stego_model)")
 
 
     args = parser.parse_args()
 
+    dataset_path = AVAILABLE_DATASETS[args.dataset_name]
+
     if not args.debug:
-        run_name = f"{args.method}_{args.model}_t{args.temp}_ls{args.lambda_sim}_e{args.epochs}_lr{args.lr}"
+        run_name = f"{args.method}_{args.model}_ds-{args.dataset_name}_t{args.temp}_ls{args.lambda_sim}_e{args.epochs}_lr{args.lr}"
         wandb.init(project="steganography", name=run_name, config=args)
     else:
         print("DEBUG mode enabled: wandb logging is OFF. Validation and some training logs will print to terminal.")
 
     # --- Dataset and DataLoaders ---
     try:
-        dataset = load_from_disk(args.dataset_path)
+        dataset = load_from_disk(dataset_path) # Use dynamically determined path
     except FileNotFoundError:
-        print(f"Error: Dataset not found at {args.dataset_path}. Please check the path.")
-        print("You might need to download or prepare the dataset first.")
+        print(f"Error: Dataset not found at {dataset_path}. Please check the path or run the appropriate dataset creation script.")
         return
         
     train_dataset = dataset["train"]
@@ -94,7 +103,7 @@ def main():
 
     # --- Model Instantiation ---
     llm_model_path = MODEL_NAMES.get(args.model, args.model) # Allow custom paths if not in MODEL_NAMES
-    model_save_path = f"{args.model_save_prefix}_{args.method}_{args.model}"
+    model_save_path = f"{args.model_save_prefix}_{args.method}_{args.model}_ds-{args.dataset_name}"
 
     if args.method == "gumbel":
         optimizer_params = {'lr': args.lr}
@@ -111,12 +120,14 @@ def main():
             scheduler_args=scheduler_params
         )
     elif args.method == "rl":
-        pass
+        # Placeholder for RL method if you implement it later
+        print("RL method not yet implemented.") 
+        return # Exit if RL is chosen but not implemented
     else:
         raise ValueError(f"Unknown method: {args.method}")
 
     # --- Training ---
-    print(f"Starting training for method: {args.method} with model: {args.model}")
+    print(f"Starting training for method: {args.method} with model: {args.model} on dataset: {args.dataset_name}")
     steg.train(train_loader, val_loader, num_epochs=args.epochs, model_save_path_prefix=model_save_path)
 
     if not args.debug:

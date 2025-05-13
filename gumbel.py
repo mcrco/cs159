@@ -272,7 +272,7 @@ class GumbelSteganographer:
                 soft_embs, intermediate_encoded_texts, enc_attention_mask = \
                     self.generate_encoded_text_or_embeddings(
                         buffers, current_bits_list, produce_embeddings=True
-                    )
+                )
 
                 # --- Decode using soft embeddings to get bit logits ---
                 bit_logits = self.predict_bits_from_encoded_text(
@@ -292,7 +292,7 @@ class GumbelSteganographer:
                 # Sim_model was initialized to DEVICE, so its output should be too.
                 sim_scores = util.cos_sim(orig_emb, enc_emb).diag()
                 loss_sim = (1 - sim_scores).mean() # Ensure this is on model.device for loss accumulation
-                
+
                 loss = loss_bit + self.lambda_sim * loss_sim.to(loss_bit.device) # Ensure loss_sim is on same device
                 loss.backward()
                 optimizer.step()
@@ -360,7 +360,7 @@ class GumbelSteganographer:
 
                 # Decode (using inference path of predict_bits_from_encoded_text)
                 predicted_bit_text = self.predict_bits_from_encoded_text(encoded_text)
-                
+
                 # Determine predicted bit category
                 processed_predicted_bit = "UNK"
                 if predicted_bit_text == "0":
