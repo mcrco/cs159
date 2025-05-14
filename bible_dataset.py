@@ -68,14 +68,27 @@ sentences = sent_tokenize(text)
 # For now, let's keep a basic filter.
 processed_sentences = []
 for s in sentences:
-    # Remove verse numbers like "1:2 " or "10:25 " from the beginning of sentences
-    s_cleaned = re.sub(r"^\d+:\d+\s+", "", s.strip())
-    if 5 <= len(s_cleaned.split()) <= 30:
-        processed_sentences.append(s_cleaned)
+    # Strip leading/trailing whitespace
+    current_sentence = s.strip()
+    # Remove leading verse numbers like "1:2 " or "10:25 " from the beginning of sentences
+    current_sentence = re.sub(r"^\d+:\d+\s+", "", current_sentence)
+    # Remove all remaining digits from the sentence
+    current_sentence = re.sub(r"\d+", "", current_sentence)
+    # Remove all colons
+    current_sentence = re.sub(r":", "", current_sentence)
+    # Normalize spaces (e.g., replace multiple spaces with a single space) and strip again
+    current_sentence = re.sub(r"\s+", " ", current_sentence).strip()
+
+    # Filter based on word count of the fully cleaned sentence and ensure it's not empty
+    if 12 <= len(current_sentence.split()) <= 30 and current_sentence:
+        processed_sentences.append(current_sentence)
 
 sentences = list(dict.fromkeys(processed_sentences))  # Deduplicate
 
 print(f"Found {len(sentences)} suitable sentences after filtering and deduplication.")
+
+for sentence in sentences[:20]:
+    print(sentence)
 
 # ---- Step 2: Generate examples with bit=0 and bit=1 ----
 data = []
