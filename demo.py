@@ -3,6 +3,9 @@ import os
 if os.environ.get("NO_UNSLOTH", "false") == "false":
     from unsloth import FastLanguageModel
     from unsloth.chat_templates import get_chat_template as unsloth_get_chat_template
+else:
+    print("unsloth is disabled")
+
 import argparse
 import torch
 from peft import PeftModel

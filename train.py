@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 from datasets import load_from_disk
 import wandb
 from gumbel import GumbelSteganographer
+from peft import LoraConfig
 
 MODEL_NAMES = {
     "llama": "unsloth/Llama-3.2-3B-Instruct",
@@ -109,13 +110,23 @@ def main():
     )
 
     # --- PEFT Configuration ---
-    peft_config = {
+    # Base config as dict
+    base_peft_config_dict = {
         "r": args.lora_r,
         "lora_alpha": args.lora_alpha,
         "target_modules": args.lora_target_modules,
         "lora_dropout": args.lora_dropout,
         "bias": "none",
+        "task_type": "CAUSAL_LM" # Often needed for standard PeftConfig
     }
+
+    if use_unsloth_flag:
+        peft_config_to_pass = base_peft_config_dict
+        # Unsloth's FastLanguageModel.get_peft_model might not need task_type explicitly,
+        # or handles it internally. If issues arise, it can be removed from dict for Unsloth.
+    else:
+        # For standard Transformers, create LoraConfig object
+        peft_config_to_pass = LoraConfig(**base_peft_config_dict)
 
     # --- Model Instantiation ---
     llm_model_path = MODEL_NAMES.get(args.model, args.model) # Allow custom paths if not in MODEL_NAMES
@@ -136,7 +147,7 @@ def main():
         steg = GumbelSteganographer(
             llm_model_name=llm_model_path,
             sim_model_name=args.sim_model,
-            lora_config=peft_config,
+            lora_config=peft_config_to_pass,
             temperature=args.temp,
             lambda_sim=args.lambda_sim,
             debug=args.debug,
