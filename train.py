@@ -35,6 +35,8 @@ def main():
                         help="Method to use for steganography (gumbel or rl). (default: gumbel)")
     parser.add_argument("--debug", action="store_true", 
                         help="Disable wandb and print more logs to terminal.")
+    parser.add_argument("--no_unsloth", action="store_true", 
+                        help="Disable Unsloth and use standard Transformers for model loading.")
     parser.add_argument("--model", default="qwen", 
                         help=f"Base LLM model name. Choices: {list(MODEL_NAMES.keys())}. (default: qwen)")
     parser.add_argument("--sim_model", default=SIM_MODEL_NAME, 
@@ -68,12 +70,26 @@ def main():
     args = parser.parse_args()
 
     dataset_path = AVAILABLE_DATASETS[args.dataset_name]
+    use_unsloth_flag = not args.no_unsloth
 
     if not args.debug:
-        run_name = f"{args.method}_{args.model}_ds-{args.dataset_name}_t{args.temp}_ls{args.lambda_sim}_e{args.epochs}_lr{args.lr}"
+        run_name_parts = [
+            args.method,
+            args.model,
+            f"ds-{args.dataset_name}",
+            f"t{args.temp}",
+            f"ls{args.lambda_sim}",
+            f"e{args.epochs}",
+            f"lr{args.lr}"
+        ]
+        if args.no_unsloth:
+            run_name_parts.append("no_unsloth")
+        run_name = "_".join(run_name_parts)
         wandb.init(project="steganography", name=run_name, config=args)
     else:
         print("DEBUG mode enabled: wandb logging is OFF. Validation and some training logs will print to terminal.")
+        if args.no_unsloth:
+            print("Unsloth is DISABLED for model loading.")
 
     # --- Dataset and DataLoaders ---
     try:
@@ -103,7 +119,15 @@ def main():
 
     # --- Model Instantiation ---
     llm_model_path = MODEL_NAMES.get(args.model, args.model) # Allow custom paths if not in MODEL_NAMES
-    model_save_path = f"{args.model_save_prefix}_{args.method}_{args.model}_ds-{args.dataset_name}"
+    model_save_path_parts = [
+        args.model_save_prefix,
+        args.method,
+        args.model,
+        f"ds-{args.dataset_name}"
+    ]
+    if args.no_unsloth:
+        model_save_path_parts.append("no_unsloth")
+    model_save_path = "_".join(model_save_path_parts)
 
     if args.method == "gumbel":
         optimizer_params = {'lr': args.lr}
@@ -117,7 +141,8 @@ def main():
             lambda_sim=args.lambda_sim,
             debug=args.debug,
             optimizer_args=optimizer_params,
-            scheduler_args=scheduler_params
+            scheduler_args=scheduler_params,
+            use_unsloth=use_unsloth_flag
         )
     elif args.method == "rl":
         # Placeholder for RL method if you implement it later
@@ -128,6 +153,8 @@ def main():
 
     # --- Training ---
     print(f"Starting training for method: {args.method} with model: {args.model} on dataset: {args.dataset_name}")
+    if args.no_unsloth:
+        print("Note: Running WITHOUT Unsloth optimizations.")
     steg.train(train_loader, val_loader, num_epochs=args.epochs, model_save_path_prefix=model_save_path)
 
     if not args.debug:

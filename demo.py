@@ -1,8 +1,11 @@
 from unsloth import FastLanguageModel
-from unsloth.chat_templates import get_chat_template
+from unsloth.chat_templates import get_chat_template as unsloth_get_chat_template
 import argparse
 import torch
 from peft import PeftModel
+
+# Standard Hugging Face imports, used if not using Unsloth
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -15,60 +18,79 @@ MODEL_NAMES = {
     "qwen3b": "unsloth/Qwen2.5-3B-Instruct",
     "qwen1.5b": "unsloth/Qwen2.5-1.5B-Instruct",
     "llama1b": "unsloth/Llama-3.2-1B-Instruct",
+    # Add non-Unsloth model names here if you want to map them directly, 
+    # or rely on full HF paths being passed via --model argument.
+    # For example:
+    # "hf_llama3.1_8b": "meta-llama/Llama-3.1-8B-Instruct",
 }
 
 with open("prompt.txt", "r") as f:
     INSTRUCTION = f.read()
 
-def load_model_for_demo(base_model_arg, lora_adapter_path):
+def load_model_for_demo(base_model_arg, lora_adapter_path, use_unsloth: bool = True):
     """Loads the base model, applies LoRA adapter, and returns model and tokenizer."""
-    resolved_base_model_path = MODEL_NAMES.get(base_model_arg, base_model_arg)
     
-    print(f"Loading model and tokenizer for {resolved_base_model_path} using Unsloth...")
-    # Using Unsloth's FastLanguageModel for loading
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=resolved_base_model_path,
-        max_seq_length=4096,  # A common default, can be made configurable
-        dtype=None,  # Unsloth will choose the optimal dtype (e.g., bfloat16, float16)
-        load_in_4bit=True,  # Enable 4-bit quantization for efficiency
-        # trust_remote_code=True,
-        # token=None, # Add HF token if dealing with gated models explicitly, or set HUGGING_FACE_HUB_TOKEN
-    )
+    # Resolve model path: Use MODEL_NAMES if it's a key, otherwise assume it's a direct path.
+    # If not using Unsloth, you might want to adjust MODEL_NAMES to point to standard HF paths 
+    # or ensure the user provides the full HF path for non-Unsloth models.
+    resolved_base_model_path = MODEL_NAMES.get(base_model_arg, base_model_arg)
+    model_name_for_chat_template = resolved_base_model_path # For chat template logic
 
-    if 'llama' in resolved_base_model_path:
-        tokenizer = get_chat_template(tokenizer, "llama-3.1")
-    if 'qwen' in resolved_base_model_path:
-        tokenizer = get_chat_template(tokenizer, "qwen-2.5")
+    if use_unsloth:
+        print(f"Loading model and tokenizer for {resolved_base_model_path} using Unsloth...")
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=resolved_base_model_path,
+            max_seq_length=4096,
+            dtype=None,
+            load_in_4bit=True,
+            # trust_remote_code=True, # Unsloth often handles this internally
+        )
+    else:
+        print(f"Loading model and tokenizer for {resolved_base_model_path} using standard Transformers...")
+        tokenizer = AutoTokenizer.from_pretrained(resolved_base_model_path)
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            bnb_4bit_use_double_quant=False,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            resolved_base_model_path,
+            quantization_config=bnb_config,
+            device_map="auto",
+            # trust_remote_code=True # May be needed for some models
+        )
+
+    # Apply chat template if using Unsloth and model type is known
+    if use_unsloth:
+        # Unsloth's get_chat_template is specific. For non-Unsloth, this step is skipped,
+        # relying on the tokenizer's default or manual configuration if needed.
+        if 'llama' in model_name_for_chat_template.lower():
+            tokenizer = unsloth_get_chat_template(tokenizer, chat_template="llama-3.1")
+        elif 'qwen' in model_name_for_chat_template.lower():
+            tokenizer = unsloth_get_chat_template(tokenizer, chat_template="qwen-2.5")
+        elif 'gemma' in model_name_for_chat_template.lower():
+            tokenizer = unsloth_get_chat_template(tokenizer, chat_template="gemma-3")
+        elif 'olmo' in model_name_for_chat_template.lower():
+            tokenizer = unsloth_get_chat_template(tokenizer, chat_template="olmo")
+    else:
+        print("Relying on tokenizer's default chat template or pre-configuration for non-Unsloth mode.")
 
     if tokenizer.pad_token is None:
         print("Tokenizer does not have a pad_token, setting it to eos_token.")
         tokenizer.pad_token = tokenizer.eos_token
+        if model.config.pad_token_id is None:
+            model.config.pad_token_id = tokenizer.eos_token_id
 
-    # Base model is loaded. If LoRA adapter path is provided, apply it.
-    # PeftModel.from_pretrained should work with Unsloth's base model.
     if lora_adapter_path:
         print(f"Loading LoRA adapter from {lora_adapter_path}...")
+        # PeftModel.from_pretrained works for both Unsloth and standard HF PEFT models
         model = PeftModel.from_pretrained(model, lora_adapter_path)
-        print(f"Model {resolved_base_model_path} with LoRA adapter from {lora_adapter_path} loaded with Unsloth.")
+        print(f"Model {resolved_base_model_path} with LoRA adapter from {lora_adapter_path} loaded.")
     else:
-        print(f"Base model {resolved_base_model_path} loaded with Unsloth without LoRA adapter.")
+        print(f"Base model {resolved_base_model_path} loaded without LoRA adapter.")
 
-    # Optional: Merge LoRA layers with the base model for faster inference.
-    # This makes the model no longer a PeftModel, but a standard HF model with merged weights.
-    # Note: Unsloth models are already optimized for speed.
-    # Merging with Unsloth might follow a different pattern if needed for export, e.g., model.save_pretrained_merged(...).
-    # if lora_adapter_path: # Only try to merge if LoRA was loaded
-    #     print("Merging LoRA adapter into the base model...")
-    #     model = model.merge_and_unload()
-    
-    model.eval()  # Set the model to evaluation mode
-    
-    # Get the device the model (or its first parameter) is on
-    # For models loaded with device_map="auto", different parts might be on different devices.
-    # For operations, inputs should be moved to the device of the specific module they interact with.
-    # However, model.generate() usually handles internal device placement correctly.
-    # We'll move tokenized inputs to model.device, which usually refers to the device of the first parameter.
-    # Unsloth models also have a .device attribute.
+    model.eval()
     print(f"Model is primarily on device: {model.device}")
     return model, tokenizer
 
@@ -85,32 +107,26 @@ def run_encode(model, tokenizer):
     prompt_content = f'{INSTRUCTION}\n[ENCODE]\nBuffer: "{buffer_text}"\nHide bit: {bit_to_hide}\n'
     
     messages = [{"role": "user", "content": prompt_content}]
+    # enable_thinking=False might be Unsloth specific, check if it causes issues for HF
+    # For HF, often just add_generation_prompt=True is enough.
+    # Keeping it for now, assuming it doesn't break standard HF tokenizers.
     input_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt", enable_thinking=False).to(model.device)
-    # For instruct models, generate might not need attention_mask if input_ids are already shaped by chat_template
-    # and no padding is involved in this specific input.
-    # However, if issues arise, an attention_mask=torch.ones_like(input_ids) could be added.
-    attention_mask = None # Often okay for unpadded single sequence from apply_chat_template
+    attention_mask = None 
     
     buffer_tokens_count = len(tokenizer.tokenize(buffer_text))
-    # max_new_tokens should be enough for the modified buffer text.
-    # Using buffer_tokens_count + a margin (e.g., 30) as a heuristic.
-    # Your validate function used a fixed 20, which might be too short for longer buffers.
-    current_max_new_tokens = buffer_tokens_count + 10
+    current_max_new_tokens = buffer_tokens_count + 10 # Dynamic based on buffer
 
     print(f"Encoding (max_new_tokens={current_max_new_tokens})...")
     with torch.no_grad():
         outputs = model.generate(
             input_ids=input_ids,
-            attention_mask=attention_mask, # Pass it, will be None if not set for instruct
+            attention_mask=attention_mask, 
             max_new_tokens=current_max_new_tokens, 
-            do_sample=False,  # For deterministic output
-            pad_token_id=tokenizer.eos_token_id
+            do_sample=False,  
+            pad_token_id=tokenizer.pad_token_id # Important to use the actual pad_token_id
         )
     
-    # Slice off the prompt part to get only the generated (encoded) text
-    # input_ids.shape[1] is the length of the tokenized prompt (either plain or chat-templated)
     generated_text = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
-    # generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
     print(f"\nEncoded sentence:\n{generated_text.strip()}")
 
 def run_decode(model, tokenizer):
@@ -127,12 +143,11 @@ def run_decode(model, tokenizer):
         outputs = model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_new_tokens=1,  # Expecting a single bit ("0" or "1")
+            max_new_tokens=1,  
             do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
+            pad_token_id=tokenizer.pad_token_id
         )
         
-    # input_ids.shape[1] is the length of the tokenized prompt
     predicted_bit_text = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
     print(f'\nPredicted bit: {predicted_bit_text.strip()}')
 
@@ -158,27 +173,37 @@ def run_example(model, tokenizer):
             temperature=None,
             top_p=None,
             top_k=None,
-            pad_token_id=tokenizer.eos_token_id
+            pad_token_id=tokenizer.pad_token_id
         )
     
     generated_text = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
     print(f"{generated_text.strip()}")
-        
 
 def main_demo():
     parser = argparse.ArgumentParser(description="Interactive demo for steganography model.")
     parser.add_argument("--model", type=str, default="llama1b",
-                        help="Identifier for the base LLM (e.g., 'gemma', 'llama', 'olmo', or a HF path).")
+                        help="Identifier for the base LLM. Can be a key from MODEL_NAMES or a full HF path.")
     parser.add_argument("--lora_adapter_path", type=str, default=None,
-                        help="Optional path to the trained LoRA adapter directory (e.g., ./stego_model_gumbel_llama_final).")
+                        help="Optional path to the trained LoRA adapter directory.")
+    parser.add_argument("--no_unsloth", action="store_true",
+                        help="Disable Unsloth and use standard Transformers for model loading.")
 
     args = parser.parse_args()
+    use_unsloth_flag = not args.no_unsloth
+
+    if args.no_unsloth:
+        print("Unsloth is DISABLED for model loading in the demo.")
+        # Potentially update MODEL_NAMES to non-Unsloth paths if --no_unsloth is True
+        # and the user provided a short key from MODEL_NAMES that implies an Unsloth model.
+        # This is a more advanced step; for now, we rely on the user providing a full HF path
+        # or knowing that the MODEL_NAMES key maps to a model loadable by standard Transformers.
 
     try:
-        model, tokenizer = load_model_for_demo(args.model, args.lora_adapter_path)
+        model, tokenizer = load_model_for_demo(args.model, args.lora_adapter_path, use_unsloth=use_unsloth_flag)
     except Exception as e:
         print(f"Error loading model: {e}")
-        print("Please ensure you have provided correct paths and have necessary libraries installed (e.g., bitsandbytes for 8-bit loading).")
+        print("Please ensure you have provided correct paths/model identifiers and have necessary libraries installed.")
+        print("If using --no_unsloth, ensure bitsandbytes is installed for 4-bit loading.")
         return
 
     while True:

@@ -9,7 +9,7 @@ import nltk
 # Ensure NLTK's sentence tokenizer is available
 try:
     nltk.data.find('tokenizers/punkt')
-except nltk.downloader.DownloadError:
+except:
     print("NLTK 'punkt' tokenizer not found. Downloading...")
     nltk.download('punkt', quiet=True)
 
@@ -73,7 +73,7 @@ for book in BOOKS_DATA:
         sentences = sent_tokenize(text)
 
         # Filter sentences
-        current_book_sentences = [s.strip() for s in sentences if 5 <= len(s.split()) <= 30]
+        current_book_sentences = [s.strip() for s in sentences if 8 <= len(s.split()) <= 60]
         all_sentences.extend(current_book_sentences)
         print(f"Found {len(current_book_sentences)} suitable sentences in {book['title']}.")
 

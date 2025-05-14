@@ -1,51 +1,94 @@
 import torch
-from unsloth import FastLanguageModel
-from unsloth.chat_templates import get_chat_template
 from transformers.optimization import get_linear_schedule_with_warmup
 from sentence_transformers import SentenceTransformer, util
 import wandb
 from tqdm import tqdm
+
+# Unsloth specific imports, will be used conditionally
+from unsloth import FastLanguageModel
+from unsloth.chat_templates import get_chat_template as unsloth_get_chat_template
+
+# Standard Hugging Face imports
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import get_peft_model as hf_get_peft_model # Renamed to avoid conflict if PeftModel is also imported directly
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 with open("prompt.txt", "r") as f:
     INSTRUCTION = f.read()
 
-
 class GumbelSteganographer:
     def __init__(
-        self, llm_model_name, sim_model_name, lora_config, temperature, lambda_sim, debug=False, optimizer_args=None, scheduler_args=None
+        self, 
+        llm_model_name, 
+        sim_model_name, 
+        lora_config, 
+        temperature, 
+        lambda_sim, 
+        debug=False, 
+        optimizer_args=None, 
+        scheduler_args=None,
+        use_unsloth: bool = True # New parameter
     ) -> None:
-        self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-            model_name = llm_model_name,
-            max_seq_length = 2048,
-            dtype = None,
-            load_in_4bit = True,
-            device_map = "auto",
-        )
+        self.use_unsloth = use_unsloth
+        self.model_name_for_chat_template = llm_model_name # Store original name for chat template logic
 
-        if 'llama' in llm_model_name.lower():
-            self.tokenizer = get_chat_template(self.tokenizer, chat_template="llama-3.1")
-        elif 'qwen' in llm_model_name.lower():
-            self.tokenizer = get_chat_template(self.tokenizer, chat_template="qwen-2.5")
-        elif 'gemma' in llm_model_name.lower():
-            self.tokenizer = get_chat_template(self.tokenizer, chat_template="gemma-3")
-        elif 'olmo' in llm_model_name.lower():
-            self.tokenizer = get_chat_template(self.tokenizer, chat_template="olmo")
+        if self.use_unsloth:
+            print("Using Unsloth for model loading.")
+            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                model_name=llm_model_name,
+                max_seq_length=2048,
+                dtype=None,
+                load_in_4bit=True,
+                device_map="auto",
+            )
+            # Apply Unsloth PEFT
+            self.model = FastLanguageModel.get_peft_model(self.model, **lora_config)
+        else:
+            print("Using standard Hugging Face Transformers for model loading.")
+            self.tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
+            
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                bnb_4bit_use_double_quant=False, # Often False for nf4 but can be True
+            )
+            self.model = AutoModelForCausalLM.from_pretrained(
+                llm_model_name,
+                quantization_config=bnb_config,
+                device_map="auto",
+                # trust_remote_code=True # Sometimes needed for specific models
+            )
+            # Apply standard PEFT
+            self.model = hf_get_peft_model(self.model, lora_config)
+            self.model.print_trainable_parameters() # Good practice after applying PEFT
+
+        # Chat template application (conditional for Unsloth)
+        # For non-Unsloth, rely on tokenizer's default or assume it's correctly configured.
+        # More sophisticated handling might involve mapping model names to HF chat template application methods if needed.
+        if self.use_unsloth:
+            if 'llama' in self.model_name_for_chat_template.lower():
+                self.tokenizer = unsloth_get_chat_template(self.tokenizer, chat_template="llama-3.1")
+            elif 'qwen' in self.model_name_for_chat_template.lower():
+                self.tokenizer = unsloth_get_chat_template(self.tokenizer, chat_template="qwen-2.5")
+            elif 'gemma' in self.model_name_for_chat_template.lower():
+                self.tokenizer = unsloth_get_chat_template(self.tokenizer, chat_template="gemma-3")
+            elif 'olmo' in self.model_name_for_chat_template.lower():
+                self.tokenizer = unsloth_get_chat_template(self.tokenizer, chat_template="olmo")
+        else:
+            # For standard HF, if specific chat template logic is needed beyond tokenizer default, add here.
+            # e.g., self.tokenizer.chat_template = "... specific template string ..." if necessary.
+            print("Relying on tokenizer's default chat template or pre-configuration for non-Unsloth mode.")
 
         if self.tokenizer.pad_token is None:
             print("Tokenizer does not have a pad_token, setting it to eos_token.")
             self.tokenizer.pad_token = self.tokenizer.eos_token
-            if self.model.config.pad_token_id is None: # Also set model config pad_token_id
+            # Ensure model's pad_token_id is also set, crucial for generation
+            if self.model.config.pad_token_id is None:
                  self.model.config.pad_token_id = self.tokenizer.eos_token_id
 
-
-        self.model = FastLanguageModel.get_peft_model(
-            self.model,
-            **lora_config,
-        )
         self.sim_model = SentenceTransformer(sim_model_name, device=DEVICE)
-
         self.temperature = float(temperature)
         self.lambda_sim = float(lambda_sim)
         self.debug = debug
@@ -377,4 +420,4 @@ class GumbelSteganographer:
                     print(f"Decoded bit: {processed_predicted_bit}\n")
         
         if not self.debug:
-            wandb.log({f"val/epoch_{epoch}_examples": table}, step=epoch) # Use epoch for val table step
+            wandb.log({f"val/epoch_{epoch}_examples": table}, epoch=epoch) # Use epoch for val table step
