@@ -20,6 +20,7 @@ SIM_MODEL_NAME = "all-MiniLM-L6-v2"
 
 # Define available datasets and their corresponding path prefixes/suffixes
 AVAILABLE_DATASETS = {
+    "bible": "stego_dataset_bible/",
     "childrens_classics": "stego_dataset_childrens_classics/",
     "wizard_of_oz": "stego_dataset_wizard_of_oz/",
     "pride_and_prejudice": "stego_dataset_pride_and_prejudice/",
