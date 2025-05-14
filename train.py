@@ -125,6 +125,12 @@ def main():
         default="./stego_model",
         help="Prefix for saving the trained model (default: ./stego_model)",
     )
+    parser.add_argument(
+        "--sample_fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of the dataset to use for training and validation (0.0 to 1.0). (default: 1.0)",
+    )
 
     args = parser.parse_args()
 
@@ -141,6 +147,8 @@ def main():
             f"e{args.epochs}",
             f"lr{args.lr}",
         ]
+        if args.sample_fraction < 1.0:
+            run_name_parts.append(f"sf{args.sample_fraction}")
         if args.no_unsloth:
             run_name_parts.append("no_unsloth")
         run_name = "_".join(run_name_parts)
@@ -163,6 +171,27 @@ def main():
 
     train_dataset = dataset["train"]
     val_dataset = dataset["validation"]
+
+    if args.sample_fraction < 1.0:
+        if not 0.0 < args.sample_fraction <= 1.0:
+            raise ValueError("sample_fraction must be between 0.0 (exclusive) and 1.0 (inclusive).")
+
+        print(f"Sampling {args.sample_fraction*100:.2f}% of the dataset.")
+        
+        num_train_samples = int(len(train_dataset) * args.sample_fraction)
+        train_dataset = train_dataset.shuffle(seed=42).select(range(num_train_samples))
+        print(f"Using {len(train_dataset)} samples for training after sampling.")
+
+        num_val_samples = int(len(val_dataset) * args.sample_fraction)
+        # Ensure val_dataset has at least 1 sample if num_val_samples is 0 but original val_dataset was not empty
+        if num_val_samples == 0 and len(val_dataset) > 0:
+            num_val_samples = 1 
+        if len(val_dataset) > 0: # only sample if val_dataset is not empty
+            val_dataset = val_dataset.shuffle(seed=42).select(range(num_val_samples))
+            print(f"Using {len(val_dataset)} samples for validation after sampling.")
+        else:
+            print("Validation dataset is empty, no sampling applied.")
+
 
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn
