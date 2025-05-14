@@ -279,10 +279,9 @@ class GumbelSteganographer:
             # The model's output at this position (logits_dec[b, seq_len-1, :]) is used to predict the *next* token.
             batch_indices = torch.arange(logits_dec.size(0), device=logits_dec.device)
             last_prompt_token_logits = logits_dec[batch_indices, sequence_lengths - 1]
-            bit_logits = last_prompt_token_logits[:, [self.zero_id, self.one_id]]
             
-            # Returns batched tensor even for single input if soft_embs provided
-            return bit_logits
+            # Returns batched tensor (full logits) even for single input if soft_embs provided
+            return last_prompt_token_logits # New: Return full logits for the next token
         else: # Inference/validation path, returns "0" or "1" text
             decoded_ids = self.model.generate(
                 input_ids=dec_inputs_dict['input_ids'],
@@ -324,13 +323,24 @@ class GumbelSteganographer:
                 )
 
                 # --- Decode using soft embeddings to get bit logits ---
-                bit_logits = self.predict_bits_from_encoded_text(
+                # full_decode_logits will now be the full logits [BatchSize, VocabSize]
+                full_decode_logits = self.predict_bits_from_encoded_text(
                     intermediate_encoded_texts, # These are the "encoded" texts for the DECODE prompt
                     soft_embs_from_encoder=soft_embs,
                     attention_mask_for_soft_embs=enc_attention_mask
                 )
                 
-                loss_bit = torch.nn.functional.cross_entropy(bit_logits, bits.to(self.model.device))
+                # bits is the target labels [BatchSize], containing 0 or 1.
+                # Map these to self.zero_id and self.one_id for cross_entropy loss.
+                device = full_decode_logits.device
+                target_bits_on_device = bits.to(device) # ensure bits are on the same device
+                
+                # Create target token IDs tensor. self.zero_id and self.one_id are int token IDs.
+                # Initialize with a default (e.g. zero_id) and then set for one_id.
+                target_token_ids = torch.full_like(target_bits_on_device, self.zero_id, dtype=torch.long)
+                target_token_ids[target_bits_on_device == 1] = self.one_id
+                
+                loss_bit = torch.nn.functional.cross_entropy(full_decode_logits, target_token_ids)
 
                 # --- Semantic similarity loss ---
                 # Using intermediate_encoded_texts (hard Gumbel output) for similarity
