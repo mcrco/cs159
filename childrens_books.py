@@ -8,7 +8,7 @@ import nltk
 
 # Ensure NLTK's sentence tokenizer is available
 try:
-    nltk.data.find('tokenizers/punkt')
+    sent_tokenize("example sentence.")
 except:
     print("NLTK 'punkt' tokenizer not found. Downloading...")
     nltk.download('punkt', quiet=True)

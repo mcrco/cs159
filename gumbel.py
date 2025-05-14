@@ -103,8 +103,10 @@ class GumbelSteganographer:
         self.zero_id = self.tokenizer.convert_tokens_to_ids("0")
         self.one_id = self.tokenizer.convert_tokens_to_ids("1")
         # Ensure they are single IDs if tokenizer returns lists
-        if isinstance(self.zero_id, list): self.zero_id = self.zero_id[0]
-        if isinstance(self.one_id, list): self.one_id = self.one_id[0]
+        if isinstance(self.zero_id, list): 
+            self.zero_id = self.zero_id[0]
+        if isinstance(self.one_id, list): 
+            self.one_id = self.one_id[0]
 
         self.default_generation_params = {
             "do_sample": False, "temperature": None, "top_p": None, "top_k": None, 
@@ -177,7 +179,7 @@ class GumbelSteganographer:
 
         if produce_embeddings:
             # Perform auto-regressive generation with Gumbel-Softmax
-            batch_size = enc_inputs_dict['input_ids'].size(0)
+            # batch_size = enc_inputs_dict['input_ids'].size(0)
             current_input_ids = enc_inputs_dict['input_ids']
             current_attention_mask = enc_inputs_dict['attention_mask']
             
