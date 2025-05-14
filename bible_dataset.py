@@ -19,7 +19,7 @@ except:
 DATA_DIR = "texts/"
 BOOK_FILENAME = "bible_king_james.txt"
 BOOK_PATH = os.path.join(DATA_DIR, BOOK_FILENAME)
-BOOK_URL = "https://www.gutenberg.org/cache/epub/10/pg10.txt"
+BOOK_URL = "https://www.gutenberg.org/cache/epub/30/pg30.txt"
 OUTPUT_DATASET_DIR = "stego_dataset_bible/"
 
 # Ensure the download directory exists
