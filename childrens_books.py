@@ -12,6 +12,7 @@ try:
 except:
     print("NLTK 'punkt' tokenizer not found. Downloading...")
     nltk.download('punkt', quiet=True)
+    nltk.download('punkt_tab', quiet=True)
 
 # ---- Configuration for Children's Classics ----
 BOOKS_DATA = [
@@ -19,7 +20,7 @@ BOOKS_DATA = [
     {"title": "Through the Looking-Glass", "author": "Lewis Carroll", "url": "https://www.gutenberg.org/files/12/12-0.txt", "filename": "through_the_looking_glass.txt"},
     {"title": "The Wonderful Wizard of Oz", "author": "L. Frank Baum", "url": "https://www.gutenberg.org/files/55/55-0.txt", "filename": "wizard_of_oz.txt"},
     {"title": "Peter Pan (Peter and Wendy)", "author": "J.M. Barrie", "url": "https://www.gutenberg.org/files/16/16-0.txt", "filename": "peter_pan.txt"},
-    {"title": "The Secret Garden", "author": "Frances Hodgson Burnett", "url": "https://www.gutenberg.org/files/17396/17396-0.txt", "filename": "the_secret_garden.txt"},
+    {"title": "The Secret Garden", "author": "Frances Hodgson Burnett", "url": "https://gitlab.galileo.usg.edu/ugalibs/digiuga/Gutenberg_Text/-/raw/a0b16d35a9851168ce9ac649851c17b7ab08d48e/Burnett,%20Frances%20Hodgson/The%20Secret%20Garden.txt", "filename": "the_secret_garden.txt"},
     {"title": "A Little Princess", "author": "Frances Hodgson Burnett", "url": "https://www.gutenberg.org/files/146/146-0.txt", "filename": "a_little_princess.txt"},
     {"title": "Anne of Green Gables", "author": "L. M. Montgomery", "url": "https://www.gutenberg.org/files/45/45-0.txt", "filename": "anne_of_green_gables.txt"},
     {"title": "Black Beauty", "author": "Anna Sewell", "url": "https://www.gutenberg.org/files/271/271-0.txt", "filename": "black_beauty.txt"},

@@ -1,12 +1,14 @@
+import os
+
+if os.environ.get("NO_UNSLOTH", "false") == "false":
+    from unsloth import FastLanguageModel
+    from unsloth.chat_templates import get_chat_template as unsloth_get_chat_template
+
 import torch
 from transformers.optimization import get_linear_schedule_with_warmup
 from sentence_transformers import SentenceTransformer, util
 import wandb
 from tqdm import tqdm
-
-# Unsloth specific imports, will be used conditionally
-from unsloth import FastLanguageModel
-from unsloth.chat_templates import get_chat_template as unsloth_get_chat_template
 
 # Standard Hugging Face imports
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -420,4 +422,4 @@ class GumbelSteganographer:
                     print(f"Decoded bit: {processed_predicted_bit}\n")
         
         if not self.debug:
-            wandb.log({f"val/epoch_{epoch}_examples": table}, epoch=epoch) # Use epoch for val table step
+            wandb.log({f"val/epoch_{epoch}_examples": table}, epoch=epoch)

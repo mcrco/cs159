@@ -1,10 +1,12 @@
-from unsloth import FastLanguageModel
-from unsloth.chat_templates import get_chat_template as unsloth_get_chat_template
+import os
+
+if os.environ.get("NO_UNSLOTH", "false") == "false":
+    from unsloth import FastLanguageModel
+    from unsloth.chat_templates import get_chat_template as unsloth_get_chat_template
 import argparse
 import torch
 from peft import PeftModel
 
-# Standard Hugging Face imports, used if not using Unsloth
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
