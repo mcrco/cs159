@@ -109,7 +109,7 @@ def run_encode(model, tokenizer):
             print("Invalid input. Bit must be 0 or 1.")
     bit_to_hide = int(bit_to_hide_str)
 
-    prompt_content = f'{INSTRUCTION}\n[ENCODE]\nBuffer: "{buffer_text}"\nHide bit: {bit_to_hide}\n'
+    prompt_content = f'{INSTRUCTION}\n[ENCODE]\nBuffer: {buffer_text}\nHide bit: {bit_to_hide}\n'
     
     messages = [{"role": "user", "content": prompt_content}]
     # enable_thinking=False might be Unsloth specific, check if it causes issues for HF
@@ -137,7 +137,7 @@ def run_encode(model, tokenizer):
 def run_decode(model, tokenizer):
     """Handles the decoding process in the demo."""
     encoded_text = input("Enter the encoded sentence to decode: ")
-    prompt_content = f'{INSTRUCTION}\n[DECODE] Encoded: "{encoded_text}"\n'
+    prompt_content = f'{INSTRUCTION}\n[DECODE] Encoded: {encoded_text}\n'
 
     messages = [{"role": "user", "content": prompt_content}]
     input_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt", enable_thinking=False).to(model.device)
@@ -159,13 +159,13 @@ def run_decode(model, tokenizer):
 def run_example(model, tokenizer):
     """Handles the chat process in the demo."""
     try:
-        with open("./example-prompt.txt", "r") as f: 
+        with open("./example-demo.txt", "r") as f: 
             text_content = f.read()
     except FileNotFoundError:
-        print("Error: example-prompt.txt not found in the current directory.")
+        print("Error: example-demo.txt not found in the current directory.")
         return
 
-    messages = [{"role": "user", "content": text_content}]
+    messages = [{"role": "user", "content": INSTRUCTION + text_content}]
     input_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt", enable_thinking=False).to(model.device)
     attention_mask = None
     
@@ -186,7 +186,7 @@ def run_example(model, tokenizer):
 
 def main_demo():
     parser = argparse.ArgumentParser(description="Interactive demo for steganography model.")
-    parser.add_argument("--model", type=str, default="llama1b",
+    parser.add_argument("--model", type=str, default="qwen1.5b",
                         help="Identifier for the base LLM. Can be a key from MODEL_NAMES or a full HF path.")
     parser.add_argument("--lora_adapter_path", type=str, default=None,
                         help="Optional path to the trained LoRA adapter directory.")

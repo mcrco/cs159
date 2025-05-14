@@ -2,7 +2,10 @@ import argparse
 import torch
 from torch.utils.data import DataLoader
 from datasets import load_from_disk
-import wandb
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
+import math
+
 from gumbel import GumbelSteganographer
 from peft import LoraConfig
 
@@ -71,11 +74,11 @@ def main():
     parser.add_argument(
         "--lambda_sim",
         type=float,
-        default=0.1,
-        help="Weight for similarity loss (if applicable) (default: 0.5)",
+        default=0.0,
+        help="Weight for similarity loss (if applicable) (default: 0.0)",
     )
     parser.add_argument(
-        "--epochs", type=int, default=3, help="Number of training epochs (default: 3)"
+        "--epochs", type=int, default=1, help="Number of training epochs (default: 3)"
     )
     parser.add_argument(
         "--batch_size", type=int, default=1, help="Training batch size (default: 1)"
@@ -109,16 +112,16 @@ def main():
     )
     parser.add_argument(
         "--lora_target_modules",
-        nargs="+",
+        type=str,
         default="qkv",
-        help="LoRA target modules (default: ['q_proj', 'v_proj', 'k_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']",
+        help="LoRA target modules (default: 'qkv')",
     )
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default="childrens_classics",
+        default="bible",
         choices=list(AVAILABLE_DATASETS.keys()),
-        help="Name of the dataset to use. (default: childrens_classics)",
+        help="Name of the dataset to use. (default: bible)",
     )
     parser.add_argument(
         "--model_save_prefix",
@@ -132,12 +135,19 @@ def main():
         default=1.0,
         help="Fraction of the dataset to use for training and validation (0.0 to 1.0). (default: 1.0)",
     )
+    parser.add_argument(
+        "--accumulate_grad_batches",
+        type=int,
+        default=1,
+        help="Number of steps to accumulate gradients over. (default: 1)"
+    )
 
     args = parser.parse_args()
 
     dataset_path = AVAILABLE_DATASETS[args.dataset_name]
     use_unsloth_flag = not args.no_unsloth
 
+    logger = None
     if not args.debug:
         run_name_parts = [
             args.method,
@@ -152,8 +162,11 @@ def main():
             run_name_parts.append(f"sf{args.sample_fraction}")
         if args.no_unsloth:
             run_name_parts.append("no_unsloth")
+        if args.accumulate_grad_batches > 1:
+            run_name_parts.append(f"acc{args.accumulate_grad_batches}")
         run_name = "_".join(run_name_parts)
-        wandb.init(project="steganography", name=run_name, config=args)
+        
+        logger = WandbLogger(project="steganography", name=run_name, config=args)
     else:
         print(
             "DEBUG mode enabled: wandb logging is OFF. Validation and some training logs will print to terminal."
@@ -163,7 +176,7 @@ def main():
 
     # --- Dataset and DataLoaders ---
     try:
-        dataset = load_from_disk(dataset_path)  # Use dynamically determined path
+        dataset = load_from_disk(dataset_path)
     except FileNotFoundError:
         print(
             f"Error: Dataset not found at {dataset_path}. Please check the path or run the appropriate dataset creation script."
@@ -176,32 +189,28 @@ def main():
     if args.sample_fraction < 1.0:
         if not 0.0 < args.sample_fraction <= 1.0:
             raise ValueError("sample_fraction must be between 0.0 (exclusive) and 1.0 (inclusive).")
-
         print(f"Sampling {args.sample_fraction*100:.2f}% of the dataset.")
-        
         num_train_samples = int(len(train_dataset) * args.sample_fraction)
         train_dataset = train_dataset.shuffle(seed=42).select(range(num_train_samples))
         print(f"Using {len(train_dataset)} samples for training after sampling.")
-
         num_val_samples = int(len(val_dataset) * args.sample_fraction)
-        # Ensure val_dataset has at least 1 sample if num_val_samples is 0 but original val_dataset was not empty
         if num_val_samples == 0 and len(val_dataset) > 0:
             num_val_samples = 1 
-        if len(val_dataset) > 0: # only sample if val_dataset is not empty
+        if len(val_dataset) > 0:
             val_dataset = val_dataset.shuffle(seed=42).select(range(num_val_samples))
             print(f"Using {len(val_dataset)} samples for validation after sampling.")
         else:
             print("Validation dataset is empty, no sampling applied.")
 
-
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn
+        train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.val_batch_size,
         shuffle=False,
         collate_fn=collate_fn,
+        num_workers=4
     )
 
     # --- PEFT Configuration ---
@@ -230,6 +239,11 @@ def main():
         # For standard Transformers, create LoraConfig object
         peft_config_to_pass = LoraConfig(**base_peft_config_dict, task_type="CAUSAL_LM")
 
+    # --- Calculate num_training_steps for scheduler ---
+    # This is the total number of optimizer steps across all epochs
+    num_optimizer_steps_per_epoch = math.ceil(len(train_loader) / args.accumulate_grad_batches)
+    num_training_steps = num_optimizer_steps_per_epoch * args.epochs
+
     # --- Model Instantiation ---
     llm_model_path = MODEL_NAMES.get(
         args.model, args.model
@@ -247,42 +261,45 @@ def main():
     if args.method == "gumbel":
         optimizer_params = {"lr": args.lr}
         scheduler_params = {
-            "num_warmup_steps": args.warmup_steps
-        }  # num_training_steps added in class
+            "num_warmup_steps": args.warmup_steps,
+            "num_training_steps": num_training_steps
+        }
 
-        steg = GumbelSteganographer(
+        steg_module = GumbelSteganographer(
             llm_model_name=llm_model_path,
             sim_model_name=args.sim_model,
             lora_config=peft_config_to_pass,
             temperature=args.temp,
             lambda_sim=args.lambda_sim,
-            debug=args.debug,
             optimizer_args=optimizer_params,
             scheduler_args=scheduler_params,
+            model_save_path_prefix=model_save_path,
+            debug=args.debug,
             use_unsloth=use_unsloth_flag,
         )
     elif args.method == "rl":
-        # Placeholder for RL method if you implement it later
         print("RL method not yet implemented.")
-        return  # Exit if RL is chosen but not implemented
+        return
     else:
         raise ValueError(f"Unknown method: {args.method}")
 
-    # --- Training ---
+    # --- Training with PyTorch Lightning Trainer ---
     print(
-        f"Starting training for method: {args.method} with model: {args.model} on dataset: {args.dataset_name}"
+        f"Starting training with PyTorch Lightning for method: {args.method} with model: {args.model} on dataset: {args.dataset_name}"
     )
     if args.no_unsloth:
         print("Note: Running WITHOUT Unsloth optimizations.")
-    steg.train(
-        train_loader,
-        val_loader,
-        num_epochs=args.epochs,
-        model_save_path_prefix=model_save_path,
+
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        logger=logger,
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1,
+        accumulate_grad_batches=args.accumulate_grad_batches,
     )
 
-    if not args.debug:
-        wandb.finish()
+    trainer.fit(steg_module, train_loader, val_loader)
+
     print("Training complete.")
 
 
