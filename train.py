@@ -305,7 +305,6 @@ def main():
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        enable_checkpointing=False,
     )
 
     trainer.fit(steg_module, train_loader, val_loader)
