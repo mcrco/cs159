@@ -80,13 +80,19 @@ class GumbelSteganographer(torch.nn.Module):
         self, buffers: list[str], bits_to_hide: list[int]
     ) -> list[list[dict]]:
         return [
-            [{"role": "user","content": f"{INSTRUCTION}\n[ENCODE]\nBuffer: {b}\nHide bit: {bit}\n",}]
+            [
+                {"role": "system", "content": INSTRUCTION},
+                {"role": "user","content": f"[ENCODE]\nBuffer: {b}\nHide bit: {bit}"}
+            ]
             for b, bit in zip(buffers, bits_to_hide)
         ]
 
     def _prepare_decode_prompts(self, encoded_texts: list[str]) -> list[list[dict]]:
         return [
-            [{"role": "user", "content": f"{INSTRUCTION}\n[DECODE]\nEncoded: {text}\n",}]
+            [
+                {"role": "system", "content": INSTRUCTION},
+                {"role": "user", "content": f"[DECODE]\nEncoded: {text}"}
+            ]
             for text in encoded_texts
         ]
 
@@ -123,31 +129,47 @@ class GumbelSteganographer(torch.nn.Module):
         ).to(device)
 
         if produce_embeddings:
-            current_input_ids = enc_inputs_dict["input_ids"]
+            # Initial prompt processing
+            prompt_input_ids = enc_inputs_dict["input_ids"]
             current_attention_mask = enc_inputs_dict["attention_mask"]
+            
+            # Convert initial prompt IDs to embeddings
+            current_input_embeds = self.model.get_input_embeddings()(prompt_input_ids)
+            
             emb_matrix = self.model.get_input_embeddings().weight
-            list_generated_soft_embs = []
-            list_generated_hard_ids = []
+            list_generated_soft_embs = [] # These will be the direct output fed to the decoder
+            list_generated_hard_ids = []  # These are for text for loss_sim
             num_tokens_to_generate = dynamic_generation_length
 
             for _ in range(num_tokens_to_generate):
-                model_outputs = self.model(input_ids=current_input_ids, attention_mask=current_attention_mask)
+                # Model takes embeddings directly now
+                model_outputs = self.model(inputs_embeds=current_input_embeds, attention_mask=current_attention_mask)
                 next_token_logits = model_outputs.logits[:, -1, :]
 
-                soft_dist_for_loss_bit = F.gumbel_softmax(next_token_logits, tau=self.temperature, hard=False, dim=-1)
-                current_soft_emb = torch.matmul(soft_dist_for_loss_bit.unsqueeze(1).to(emb_matrix.dtype), emb_matrix)
-                list_generated_soft_embs.append(current_soft_emb)
+                # Soft distribution for soft embeddings (used for loss_bit and next input embed)
+                soft_dist_for_next_step = F.gumbel_softmax(next_token_logits, tau=self.temperature, hard=False, dim=-1)
+                # Create the soft embedding for the current step
+                next_soft_emb_for_output_and_input = torch.matmul(soft_dist_for_next_step.unsqueeze(1).to(emb_matrix.dtype), emb_matrix)
                 
+                list_generated_soft_embs.append(next_soft_emb_for_output_and_input)
+                
+                # For hard IDs (loss_sim, intermediate text): Choose based on lambda_sim
                 if self.lambda_sim > 0.0:
+                    # Use STE: hard=True for one-hot output, soft for backward pass on this path IF it were used for grads
+                    # For generating hard IDs for loss_sim, STE helps if any part of loss_sim was meant to train the generator via these hard choices.
+                    # However, the primary gradient path for the generator is now through soft_embs.
                     ste_one_hot_output = F.gumbel_softmax(next_token_logits, tau=self.temperature, hard=True, dim=-1)
-                    hard_id_for_next_step = torch.argmax(ste_one_hot_output, dim=-1).unsqueeze(1)
+                    hard_id_for_text_gen = torch.argmax(ste_one_hot_output, dim=-1).unsqueeze(1)
                 else:
-                    hard_id_for_next_step = torch.argmax(soft_dist_for_loss_bit, dim=-1).unsqueeze(1)
+                    # No STE needed for loss_sim if lambda_sim is 0, just use argmax on the soft distribution
+                    hard_id_for_text_gen = torch.argmax(soft_dist_for_next_step, dim=-1).unsqueeze(1)
                 
-                list_generated_hard_ids.append(hard_id_for_next_step)
+                list_generated_hard_ids.append(hard_id_for_text_gen)
                 
-                current_input_ids = torch.cat([current_input_ids, hard_id_for_next_step], dim=1)
-                current_attention_mask = torch.cat([current_attention_mask, torch.ones_like(hard_id_for_next_step, device=device)], dim=1)
+                # Update inputs for the next iteration using the generated soft embedding
+                current_input_embeds = torch.cat([current_input_embeds, next_soft_emb_for_output_and_input], dim=1)
+                # Update attention mask
+                current_attention_mask = torch.cat([current_attention_mask, torch.ones_like(hard_id_for_text_gen, device=device)], dim=1) # Shape of hard_id is (batch, 1) like attention extension
 
             final_soft_embs = torch.cat(list_generated_soft_embs, dim=1)
             final_hard_ids = torch.cat(list_generated_hard_ids, dim=1)

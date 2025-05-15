@@ -1,4 +1,4 @@
-import unsloth
+import unsloth # necessary for proper loading of unsloth models
 
 import argparse
 import torch
@@ -7,6 +7,7 @@ from datasets import load_from_disk
 import math
 import wandb
 from tqdm import tqdm
+import random # For shuffling seeds per epoch
 
 from transformers.optimization import get_linear_schedule_with_warmup
 
@@ -82,7 +83,7 @@ def main():
         "--epochs", type=int, default=1, help="Number of training epochs (default: 1)"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=1, help="Training batch size (default: 1)"
+        "--batch_size", type=int, default=1, help="Training batch size (per gradient accumulation step) (default: 1)"
     )
     parser.add_argument(
         "--val_batch_size",
@@ -142,6 +143,11 @@ def main():
         default=1,
         help="Number of steps to accumulate gradients over. (default: 1)"
     )
+    parser.add_argument(
+        "--sample_per_epoch",
+        action="store_true",
+        help="Enable sampling of the dataset at the beginning of each epoch."
+    )
 
     args = parser.parse_args()
 
@@ -172,6 +178,8 @@ def main():
         ]
         if args.sample_fraction < 1.0:
             run_name_parts.append(f"sf{args.sample_fraction}")
+        if args.sample_per_epoch:
+            run_name_parts.append("spe")
         if args.no_unsloth:
             run_name_parts.append("no_unsloth")
         if args.accumulate_grad_batches > 1:
@@ -186,42 +194,72 @@ def main():
 
     # --- Dataset and DataLoaders ---
     try:
-        dataset = load_from_disk(dataset_path)
+        full_dataset = load_from_disk(dataset_path)
     except FileNotFoundError:
         print(
             f"Error: Dataset not found at {dataset_path}. Please check the path or run the appropriate dataset creation script."
         )
         return
 
-    train_dataset = dataset["train"]
-    val_dataset = dataset["validation"]
+    train_dataset_full = full_dataset["train"]
+    val_dataset_full = full_dataset.get("validation") # Use .get() in case validation set is missing
+    test_dataset_full = full_dataset.get("test") # Load the test set
 
-    if args.sample_fraction < 1.0:
+    # Initial sampling if not doing per-epoch sampling (legacy behavior)
+    if not args.sample_per_epoch and args.sample_fraction < 1.0:
         if not 0.0 < args.sample_fraction <= 1.0:
-            raise ValueError("sample_fraction must be between 0.0 (exclusive) and 1.0 (inclusive).")
-        print(f"Sampling {args.sample_fraction*100:.2f}% of the dataset.")
-        num_train_samples = int(len(train_dataset) * args.sample_fraction)
-        train_dataset = train_dataset.shuffle(seed=42).select(range(num_train_samples))
-        print(f"Using {len(train_dataset)} samples for training after sampling.")
-        num_val_samples = int(len(val_dataset) * args.sample_fraction)
-        if num_val_samples == 0 and len(val_dataset) > 0:
-            num_val_samples = 1 
-        if len(val_dataset) > 0:
-            val_dataset = val_dataset.shuffle(seed=42).select(range(num_val_samples))
-            print(f"Using {len(val_dataset)} samples for validation after sampling.")
+            raise ValueError("sample_fraction error.")
+        print(f"Initial sampling of training dataset: {args.sample_fraction*100:.2f}%")
+        num_train_samples = int(len(train_dataset_full) * args.sample_fraction)
+        train_dataset_to_use = train_dataset_full.shuffle(seed=42).select(range(num_train_samples))
+        print(f"Using {len(train_dataset_to_use)} samples for training initially.")
+        if val_dataset_full:
+            print(f"Initial sampling of validation dataset: {args.sample_fraction*100:.2f}%")
+            num_val_samples = int(len(val_dataset_full) * args.sample_fraction)
+            if num_val_samples == 0 and len(val_dataset_full) > 0: num_val_samples = 1 
+            val_dataset_to_use = val_dataset_full.shuffle(seed=42).select(range(num_val_samples))
+            print(f"Using {len(val_dataset_to_use)} samples for validation initially.")
         else:
-            print("Validation dataset is empty, no sampling applied.")
+            val_dataset_to_use = None
+        
+        # Test set is NOT sampled initially, always use full if available
+        test_dataset_to_use = test_dataset_full
+        if test_dataset_to_use:
+            print(f"Using all {len(test_dataset_to_use)} samples for test set (no initial sampling).")
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.val_batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=4
-    ) if len(val_dataset) > 0 else None
+    else: # args.sample_per_epoch is True OR args.sample_fraction is 1.0
+        train_dataset_to_use = train_dataset_full
+        val_dataset_to_use = val_dataset_full
+        test_dataset_to_use = test_dataset_full # Always use full test set
+        if test_dataset_to_use:
+             print(f"Using all {len(test_dataset_to_use)} samples for test set.")
+
+    # DataLoaders will be initialized inside the epoch loop if sample_per_epoch is True
+    # Otherwise, initialized once here
+    if not args.sample_per_epoch:
+        train_loader = DataLoader(
+            train_dataset_to_use, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4
+        )
+        val_loader = DataLoader(
+            val_dataset_to_use,
+            batch_size=args.val_batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=4
+        ) if val_dataset_to_use and len(val_dataset_to_use) > 0 else None
+        
+        test_loader = DataLoader(
+            test_dataset_to_use,
+            batch_size=args.val_batch_size, # Use val_batch_size for test loader as well
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=4
+        ) if test_dataset_to_use and len(test_dataset_to_use) > 0 else None
+    else:
+        # Placeholders, will be set in epoch loop
+        train_loader = None 
+        val_loader = None
+        test_loader = None # Will be set after epoch loop based on full test dataset if sample_per_epoch
 
     # --- PEFT Configuration ---
     lora_target_modules_list = []
@@ -260,6 +298,8 @@ def main():
     ]
     if args.no_unsloth:
         model_save_path_parts.append("no_unsloth")
+    if args.sample_per_epoch:
+        model_save_path_parts.append("spe")
     model_save_path = "_".join(model_save_path_parts)
 
     steg_module_class = GumbelSteganographer if use_unsloth_flag else GumbelSteganographerHF
@@ -278,107 +318,161 @@ def main():
     # Optimizer args were part of GumbelSteganographer in PL, now we define them here.
     optimizer = torch.optim.AdamW(steg_module.model.parameters(), lr=args.lr) 
     
-    num_training_steps = math.ceil(len(train_loader) / args.accumulate_grad_batches) * args.epochs
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=num_training_steps
-    )
-
     print(f"Starting training (manual PyTorch loop) for method: {args.method}...")
 
     # --- Training Loop ---
     global_step = 0
     for epoch in range(args.epochs):
         steg_module.train() # Set model to training mode
-        epoch_train_loss = 0
-        epoch_train_bit_loss = 0
-        epoch_train_sim_loss = 0
+        epoch_total_loss_sum = 0 
+        epoch_bit_loss_sum = 0   
+        epoch_sim_loss_sum = 0  
+        num_optimizer_steps_this_epoch = 0
+        num_micro_batches_processed_epoch = 0
+
+        current_epoch_train_dataset = train_dataset_full
+        current_epoch_val_dataset = val_dataset_full
+
+        if args.sample_per_epoch and args.sample_fraction < 1.0:
+            epoch_seed = 42 + epoch # Vary seed per epoch
+            print(f"\nEpoch {epoch+1}: Sampling training dataset ({args.sample_fraction*100:.2f}%) with seed {epoch_seed}")
+            num_train_samples_epoch = int(len(train_dataset_full) * args.sample_fraction)
+            current_epoch_train_dataset = train_dataset_full.shuffle(seed=epoch_seed).select(range(num_train_samples_epoch))
+            print(f"Using {len(current_epoch_train_dataset)} samples for training this epoch.")
+            if val_dataset_full:
+                print(f"Epoch {epoch+1}: Sampling validation dataset ({args.sample_fraction*100:.2f}%) with seed {epoch_seed}")
+                num_val_samples_epoch = int(len(val_dataset_full) * args.sample_fraction)
+                if num_val_samples_epoch == 0 and len(val_dataset_full) > 0: num_val_samples_epoch = 1
+                current_epoch_val_dataset = val_dataset_full.shuffle(seed=epoch_seed).select(range(num_val_samples_epoch))
+                print(f"Using {len(current_epoch_val_dataset)} samples for validation this epoch.")
+            else:
+                current_epoch_val_dataset = None
         
+        # Re-initialize DataLoaders for the current epoch's datasets
+        train_loader = DataLoader(
+            current_epoch_train_dataset, batch_size=args.batch_size, shuffle=True, 
+            collate_fn=collate_fn, num_workers=4
+        )
+        val_loader = DataLoader(
+            current_epoch_val_dataset, batch_size=args.val_batch_size, shuffle=False, 
+            collate_fn=collate_fn, num_workers=4
+        ) if current_epoch_val_dataset and len(current_epoch_val_dataset) > 0 else None
+
+        if epoch == 0 or args.sample_per_epoch: # Calculate scheduler steps based on current train_loader
+            num_optimizer_steps_per_epoch = math.ceil(len(train_loader) / args.accumulate_grad_batches)
+            num_total_optimizer_steps_for_scheduler = num_optimizer_steps_per_epoch * args.epochs # Or adjust if dynamic
+            if args.sample_per_epoch:
+                 # If sampling per epoch, total steps for scheduler might be an estimate or based on first epoch
+                 # For simplicity, let's base it on the current epoch's loader for all epochs when sampling per epoch
+                 # Or, more accurately, sum of optimizer steps across all planned epochs if lengths vary wildly.
+                 # Let's assume for now that sample_fraction keeps loader length relatively constant for scheduler purposes.
+                 num_total_optimizer_steps_for_scheduler = num_optimizer_steps_per_epoch * args.epochs
+            else: # If not sampling per epoch, this was calculated once outside
+                 num_total_optimizer_steps_for_scheduler = math.ceil(len(train_loader) / args.accumulate_grad_batches) * args.epochs
+
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer, num_warmup_steps=args.warmup_steps, 
+                num_training_steps=num_total_optimizer_steps_for_scheduler
+            )
+            print(f"Scheduler re/initialized. Optimizer steps per epoch: {num_optimizer_steps_per_epoch}, Total for scheduler: {num_total_optimizer_steps_for_scheduler}")
+
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} Training", leave=False)
-        for batch_idx, batch in enumerate(progress_bar):
-            buffers, bits = batch
-            bits = bits.to(device) # Move bits to device
+        for batch_idx, batch_data in enumerate(progress_bar):
+            buffers, bits = batch_data 
+            bits_on_device = bits.to(device)
 
-            # Forward pass through GumbelSteganographer's compute_loss method
-            total_loss, loss_bit, loss_sim, intermediate_encoded_texts = steg_module.compute_loss(buffers, bits, device)
-
-            # Normalize loss for gradient accumulation
-            if args.accumulate_grad_batches > 1:
-                total_loss = total_loss / args.accumulate_grad_batches
+            loss, bit_loss, sim_loss, intermediate_encoded_texts = steg_module.compute_loss(buffers, bits_on_device, device)
             
-            total_loss.backward()
+            if args.debug:
+                print(f"\n--- Debug: Epoch {epoch+1}, Micro-Batch {batch_idx+1}/{len(train_loader)}, Global Step (pending): {global_step} ---")
+                print(f'Buffer: {buffers[0]}') 
+                print(f'Encoded (from loss calc): {intermediate_encoded_texts[0]}')
+                print(f"Target Bit: {bits[0].item()}")
+                with torch.no_grad():
+                    steg_module.eval() 
+                    predicted_bit_debug_list = steg_module.predict_bits_from_encoded_text(intermediate_encoded_texts[0], device=device)
+                    predicted_bit_debug = predicted_bit_debug_list
+                    if isinstance(predicted_bit_debug, list): predicted_bit_debug = predicted_bit_debug[0]
+                    steg_module.train() 
+                print(f"Predicted Bit (on this example): {predicted_bit_debug}\n")
+
+            effective_loss = loss
+            if args.accumulate_grad_batches > 1:
+                effective_loss = loss / args.accumulate_grad_batches
+            
+            effective_loss.backward()
+
+            # Accumulate micro-batch losses for epoch averaging
+            # loss, bit_loss, sim_loss are from the current micro-batch
+            epoch_bit_loss_sum += bit_loss.item() 
+            epoch_sim_loss_sum += sim_loss.item()
+            num_micro_batches_processed_epoch += 1
 
             if (batch_idx + 1) % args.accumulate_grad_batches == 0 or (batch_idx + 1) == len(train_loader):
                 optimizer.step()
-                scheduler.step() # Scheduler steps with optimizer
+                scheduler.step()
                 optimizer.zero_grad()
-            
-            epoch_train_loss += total_loss.item() * args.accumulate_grad_batches if args.accumulate_grad_batches > 1 else total_loss.item()
-            epoch_train_bit_loss += loss_bit.item()
-            epoch_train_sim_loss += loss_sim.item()
+                global_step += 1
+                num_optimizer_steps_this_epoch += 1
+                
+                # Loss for this optimizer step (sum of accumulated micro-batch losses)
+                # `loss` here is the last micro-batch loss (potentially scaled by accum_grad_batches)
+                # To get the true loss for this step, we'd sum up the unscaled losses of micro-batches.
+                # For simplicity in logging, we log the last micro-batch's main loss value, scaled as if it were the step loss.
+                current_step_loss_val = loss.item() # This is the loss from the last micro-batch in accumulation window
+                epoch_total_loss_sum += current_step_loss_val 
 
-            if not args.debug:
-                wandb.log({
-                    "train/step_loss": total_loss.item() * args.accumulate_grad_batches if args.accumulate_grad_batches > 1 else total_loss.item(),
-                    "train/step_bit_loss": loss_bit.item(),
-                    "train/step_sim_loss": loss_sim.item(),
-                    "learning_rate": scheduler.get_last_lr()[0],
-                    "global_step": global_step
+                if not args.debug:
+                    wandb.log({
+                        "train/step_loss": current_step_loss_val,
+                        "train/step_bit_loss": bit_loss.item(), # from last micro-batch
+                        "train/step_sim_loss": sim_loss.item(), # from last micro-batch
+                        "learning_rate": scheduler.get_last_lr()[0],
+                        "global_step": global_step
+                    })
+                
+                progress_bar.set_postfix({
+                    "loss (step)": f"{current_step_loss_val:.4f}", 
+                    "bit_l (batch)": f"{bit_loss.item():.4f}", 
+                    "sim_l (batch)": f"{sim_loss.item():.4f}",
+                    "step": global_step
                 })
-            
-            progress_bar.set_postfix({
-                "loss": f"{total_loss.item():.4f}", 
-                "bit_l": f"{loss_bit.item():.4f}", 
-                "sim_l": f"{loss_sim.item():.4f}"
-            })
-            global_step += 1
-
-            if args.debug and global_step % 10 == 0 and batch_idx % args.accumulate_grad_batches == 0:
-                print(f"--- Training Step {global_step} (Epoch {epoch+1}, Batch {batch_idx+1}) ---")
-                print(f'Buffer: {buffers[0]}')
-                print(f'Encoded (for DECODE): {intermediate_encoded_texts[0]}')
-                print(f"Target Bit: {bits[0].item()}") # Assuming bits is a tensor
-                # For predicted bit, we need to run inference part
-                # This might be too slow for every debug step, but for illustration:
-                with torch.no_grad():
-                    steg_module.eval() # Set to eval for this prediction
-                    predicted_bits_texts_log = steg_module.predict_bits_from_encoded_text(intermediate_encoded_texts[0], device=device)
-                    steg_module.train() # Set back to train
-                print(f"Predicted Bit (by DECODE part): {predicted_bits_texts_log}\n")
-
-        avg_train_loss = epoch_train_loss / len(train_loader)
-        avg_train_bit_loss = epoch_train_bit_loss / len(train_loader)
-        avg_train_sim_loss = epoch_train_sim_loss / len(train_loader)
-        print(f"Epoch {epoch+1} Avg Train Loss: {avg_train_loss:.4f}, Avg Bit Loss: {avg_train_bit_loss:.4f}, Avg Sim Loss: {avg_train_sim_loss:.4f}")
+        
+        # --- End of Epoch Training Summary ---
+        avg_epoch_total_loss = epoch_total_loss_sum / num_optimizer_steps_this_epoch if num_optimizer_steps_this_epoch > 0 else 0
+        avg_epoch_bit_loss = epoch_bit_loss_sum / num_micro_batches_processed_epoch if num_micro_batches_processed_epoch > 0 else 0
+        avg_epoch_sim_loss = epoch_sim_loss_sum / num_micro_batches_processed_epoch if num_micro_batches_processed_epoch > 0 else 0
+        
+        print(f"Epoch {epoch+1} Training Summary: Avg Total Loss (per optim step): {avg_epoch_total_loss:.4f}, Avg Bit Loss (per micro-batch): {avg_epoch_bit_loss:.4f}, Avg Sim Loss (per micro-batch): {avg_epoch_sim_loss:.4f}")
         if not args.debug:
             wandb.log({
-                "train/epoch_loss": avg_train_loss,
-                "train/epoch_bit_loss": avg_train_bit_loss,
-                "train/epoch_sim_loss": avg_train_sim_loss,
+                "train/epoch_total_loss": avg_epoch_total_loss,
+                "train/epoch_bit_loss": avg_epoch_bit_loss,
+                "train/epoch_sim_loss": avg_epoch_sim_loss,
                 "epoch": epoch + 1
             })
 
-        # --- Validation Loop ---
+        # --- Validation Loop (End of Epoch) ---
         if val_loader:
-            steg_module.eval() # Set model to evaluation mode
+            steg_module.eval()
             val_outputs = []
             epoch_val_bit_accuracy_sum = 0
             num_val_samples_processed = 0
-
+            print(f"\nRunning validation for Epoch {epoch+1} on {len(val_loader.dataset)} samples...")
             val_progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} Validation", leave=False)
             with torch.no_grad():
-                for val_batch in val_progress_bar:
-                    val_buffers, val_bits = val_batch
-                    # val_bits = val_bits.to(device) # Already tensor, move to device
+                for val_batch_idx, val_batch_data in enumerate(val_progress_bar):
+                    val_buffers, val_bits = val_batch_data
+                    # val_bits is already a tensor from collate_fn
 
                     for i in range(len(val_buffers)):
                         buf = val_buffers[i]
                         target_bit_val = val_bits[i].item()
 
-                        # Ensure generation and prediction happen on the correct device
                         encoded_text_list = steg_module.generate_encoded_text_or_embeddings(
                             buf, target_bit_val, produce_embeddings=False, device=device
                         )
-                        encoded_text = encoded_text_list # It returns a list with one item or single string
+                        encoded_text = encoded_text_list
                         if isinstance(encoded_text, list): encoded_text = encoded_text[0]
                         
                         predicted_bit_text_list = steg_module.predict_bits_from_encoded_text(encoded_text, device=device)
@@ -393,6 +487,9 @@ def main():
                         epoch_val_bit_accuracy_sum += 1 if is_correct else 0
                         num_val_samples_processed +=1
 
+                        if val_batch_idx < 2 and i < 5 and args.debug: # Print few examples during debug validation
+                             print(f"  Val Ex: Buf='{buf[:50]}...', Target={target_bit_val}, Enc='{encoded_text[:50]}...', Dec={processed_predicted_bit}")
+
                         val_outputs.append({
                             "buffer": buf, "encoded_sentence": encoded_text,
                             "decoded_bit": processed_predicted_bit, "target_bit": str(target_bit_val)
@@ -403,19 +500,85 @@ def main():
 
             if not args.debug:
                 wandb.log({"val/bit_accuracy": avg_val_bit_accuracy, "epoch": epoch + 1})
-                # Log table of examples (careful with large validation sets)
-                # Log a subset if too large, e.g., val_outputs[:50]
                 wandb_table_data = [[item["buffer"], item["encoded_sentence"], item["decoded_bit"], item["target_bit"]] for item in val_outputs[:min(len(val_outputs), 100)]]
                 wandb_table = wandb.Table(columns=["buffer", "encoded_sentence", "decoded_bit", "target_bit"], data=wandb_table_data)
                 wandb.log({f"val/epoch_{epoch+1}_examples": wandb_table})
-            else: # Debug mode: print some validation examples
-                print(f"--- Validation Epoch {epoch+1} Examples (first few) ---")
-                for output in val_outputs[:min(len(val_outputs), 5)]:
-                    print(f'Buffer: "{output["buffer"]}" Target: {output["target_bit"]} Encoded: "{output["encoded_sentence"]}" Decoded: {output["decoded_bit"]}')
-    
-    # --- End of Training --- 
+        else:
+            print(f"Epoch {epoch+1}: No validation loader/data.")
+
     print("Training complete.")
     steg_module.save_model() # Call the save method from the module
+
+    # --- Test Loop (After Training) ---
+    if test_dataset_full: # Only run if a test dataset was loaded initially
+        print(f"Starting final test evaluation...")
+        
+        # For the final test, we always use the full test set loaded.
+        final_test_dataset_to_use = test_dataset_full
+
+        if final_test_dataset_to_use and len(final_test_dataset_to_use) > 0:
+            current_test_loader = DataLoader(
+                final_test_dataset_to_use,
+                batch_size=args.val_batch_size, # Re-use val_batch_size
+                shuffle=False,
+                collate_fn=collate_fn,
+                num_workers=4
+            )
+            print(f"Evaluating on {len(current_test_loader.dataset)} test samples.")
+
+            steg_module.eval()
+            test_outputs = []
+            test_bit_accuracy_sum = 0
+            num_test_samples_processed = 0
+            
+            test_progress_bar = tqdm(current_test_loader, desc="Final Test Evaluation", leave=False)
+            with torch.no_grad():
+                for test_batch_idx, test_batch_data in enumerate(test_progress_bar):
+                    test_buffers, test_bits = test_batch_data
+
+                    for i in range(len(test_buffers)):
+                        buf = test_buffers[i]
+                        target_bit_val = test_bits[i].item()
+
+                        encoded_text_list = steg_module.generate_encoded_text_or_embeddings(
+                            buf, target_bit_val, produce_embeddings=False, device=device
+                        )
+                        encoded_text = encoded_text_list
+                        if isinstance(encoded_text, list): encoded_text = encoded_text[0]
+                        
+                        predicted_bit_text_list = steg_module.predict_bits_from_encoded_text(encoded_text, device=device)
+                        predicted_bit_text = predicted_bit_text_list
+                        if isinstance(predicted_bit_text, list): predicted_bit_text = predicted_bit_text[0]
+
+                        processed_predicted_bit = "UNK"
+                        if predicted_bit_text == "0": processed_predicted_bit = "0"
+                        elif predicted_bit_text == "1": processed_predicted_bit = "1"
+                        
+                        is_correct = (str(target_bit_val) == processed_predicted_bit)
+                        test_bit_accuracy_sum += 1 if is_correct else 0
+                        num_test_samples_processed +=1
+
+                        if test_batch_idx < 2 and i < 5 and args.debug: 
+                             print(f"  Test Ex: Buf='{buf[:50]}...', Target={target_bit_val}, Enc='{encoded_text[:50]}...', Dec={processed_predicted_bit}")
+
+                        test_outputs.append({
+                            "buffer": buf, "encoded_sentence": encoded_text,
+                            "decoded_bit": processed_predicted_bit, "target_bit": str(target_bit_val)
+                        })
+            
+            avg_test_bit_accuracy = (test_bit_accuracy_sum / num_test_samples_processed) * 100 if num_test_samples_processed > 0 else 0
+            print(f"Final Test Bit Accuracy: {avg_test_bit_accuracy:.2f}%")
+
+            if not args.debug:
+                wandb.log({"test/bit_accuracy": avg_test_bit_accuracy})
+                if test_outputs:
+                    wandb_test_table_data = [[item["buffer"], item["encoded_sentence"], item["decoded_bit"], item["target_bit"]] for item in test_outputs[:min(len(test_outputs), 100)]]
+                    wandb_test_table = wandb.Table(columns=["buffer", "encoded_sentence", "decoded_bit", "target_bit"], data=wandb_test_table_data)
+                    wandb.log({"test/final_examples": wandb_test_table})
+        else:
+            print("No test samples to evaluate or test_dataset_to_use is None/empty.")
+    else:
+        print("No test dataset split found. Skipping final test evaluation.")
 
     if not args.debug:
         wandb.finish()

@@ -109,9 +109,13 @@ def run_encode(model, tokenizer):
             print("Invalid input. Bit must be 0 or 1.")
     bit_to_hide = int(bit_to_hide_str)
 
-    prompt_content = f'{INSTRUCTION}\n[ENCODE]\nBuffer: {buffer_text}\nHide bit: {bit_to_hide}\n'
+    # prompt_content = f'{INSTRUCTION}\n[ENCODE]\nBuffer: {buffer_text}\nHide bit: {bit_to_hide}\n'
     
-    messages = [{"role": "user", "content": prompt_content}]
+    # messages = [{"role": "user", "content": prompt_content}]
+    messages = [
+        {"role": "system", "content": INSTRUCTION},
+        {"role": "user", "content": f"[ENCODE]\nBuffer: {buffer_text}\nHide bit: {bit_to_hide}"}
+    ]
     # enable_thinking=False might be Unsloth specific, check if it causes issues for HF
     # For HF, often just add_generation_prompt=True is enough.
     # Keeping it for now, assuming it doesn't break standard HF tokenizers.
@@ -137,9 +141,13 @@ def run_encode(model, tokenizer):
 def run_decode(model, tokenizer):
     """Handles the decoding process in the demo."""
     encoded_text = input("Enter the encoded sentence to decode: ")
-    prompt_content = f'{INSTRUCTION}\n[DECODE] Encoded: {encoded_text}\n'
+    # prompt_content = f'{INSTRUCTION}\n[DECODE] Encoded: {encoded_text}\n'
 
-    messages = [{"role": "user", "content": prompt_content}]
+    # messages = [{"role": "user", "content": prompt_content}]
+    messages = [
+        {"role": "system", "content": INSTRUCTION},
+        {"role": "user", "content": f"[DECODE] Encoded: {encoded_text}"}
+    ]
     input_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt", enable_thinking=False).to(model.device)
     attention_mask = None 
 
@@ -165,7 +173,11 @@ def run_example(model, tokenizer):
         print("Error: example-demo.txt not found in the current directory.")
         return
 
-    messages = [{"role": "user", "content": INSTRUCTION + text_content}]
+    # messages = [{"role": "user", "content": INSTRUCTION + text_content}]
+    messages = [
+        {"role": "system", "content": INSTRUCTION},
+        {"role": "user", "content": text_content}
+    ]
     input_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt", enable_thinking=False).to(model.device)
     attention_mask = None
     
