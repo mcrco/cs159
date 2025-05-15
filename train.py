@@ -1,11 +1,14 @@
 import unsloth
+
 import argparse
 import torch
 from torch.utils.data import DataLoader
 from datasets import load_from_disk
-import pytorch_lightning as pl
-from pytorch_lightning.loggers import WandbLogger
 import math
+import wandb
+from tqdm import tqdm
+
+from transformers.optimization import get_linear_schedule_with_warmup
 
 MODEL_NAMES = {
     "llama": "unsloth/Llama-3.2-3B-Instruct",
@@ -35,7 +38,7 @@ def collate_fn(batch):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train a steganography model.")
+    parser = argparse.ArgumentParser(description="Train a steganography model with PyTorch.")
     parser.add_argument(
         "--method",
         type=str,
@@ -76,7 +79,7 @@ def main():
         help="Weight for similarity loss (if applicable) (default: 0.0)",
     )
     parser.add_argument(
-        "--epochs", type=int, default=1, help="Number of training epochs (default: 3)"
+        "--epochs", type=int, default=1, help="Number of training epochs (default: 1)"
     )
     parser.add_argument(
         "--batch_size", type=int, default=1, help="Training batch size (default: 1)"
@@ -142,17 +145,21 @@ def main():
 
     args = parser.parse_args()
 
+    # --- Setup Device --- 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
     dataset_path = AVAILABLE_DATASETS[args.dataset_name]
     use_unsloth_flag = not args.no_unsloth
 
-    # Import HF specific modules if not using unsloth
+    LoraConfig = None # Initialize, might be imported if not use_unsloth_flag
     if not use_unsloth_flag:
         from gumbel_hf import GumbelSteganographerHF
-        from peft import LoraConfig
+        from peft import LoraConfig # Import LoraConfig for HF case
     else:
         from gumbel import GumbelSteganographer
 
-    logger = None
+    # --- Wandb Logger Setup (manual) ---
     if not args.debug:
         run_name_parts = [
             args.method,
@@ -161,7 +168,7 @@ def main():
             f"t{args.temp}",
             f"ls{args.lambda_sim}",
             f"e{args.epochs}",
-            f"lr{args.lr}",
+            f"lr{args.lr}"
         ]
         if args.sample_fraction < 1.0:
             run_name_parts.append(f"sf{args.sample_fraction}")
@@ -171,13 +178,11 @@ def main():
             run_name_parts.append(f"acc{args.accumulate_grad_batches}")
         run_name = "_".join(run_name_parts)
         
-        logger = WandbLogger(project="steganography", name=run_name, config=args)
+        wandb.init(project="steganography", name=run_name, config=args)
     else:
-        print(
-            "DEBUG mode enabled: wandb logging is OFF. Validation and some training logs will print to terminal."
-        )
+        print("DEBUG mode enabled: wandb logging is OFF.")
         if args.no_unsloth:
-            print("Unsloth is DISABLED for model loading. Using Hugging Face Transformers.")
+            print("Unsloth is DISABLED. Using Hugging Face Transformers.")
 
     # --- Dataset and DataLoaders ---
     try:
@@ -216,37 +221,32 @@ def main():
         shuffle=False,
         collate_fn=collate_fn,
         num_workers=4
-    )
+    ) if len(val_dataset) > 0 else None
 
     # --- PEFT Configuration ---
-    lora_target_modules = []
-    for m in args.lora_target_modules:
-        target_mod = f"{m}_proj"
-        if m not in "qkvogud":
-            raise ValueError(f"{target_mod} is not tuneable parameter")
-        lora_target_modules.append(target_mod)
-
-    # Base config as dict
+    lora_target_modules_list = []
+    if args.lora_target_modules:
+        for m_char in args.lora_target_modules: # Assuming qkv means q_proj, k_proj, v_proj
+            if m_char == 'q': lora_target_modules_list.append("q_proj")
+            elif m_char == 'k': lora_target_modules_list.append("k_proj")
+            elif m_char == 'v': lora_target_modules_list.append("v_proj")
+            elif m_char == 'o': lora_target_modules_list.append("o_proj")
+            elif m_char == 'g': lora_target_modules_list.append("gate_proj")
+            elif m_char == 'u': lora_target_modules_list.append("up_proj")
+            elif m_char == 'd': lora_target_modules_list.append("down_proj")
+            else: print(f"Warning: Unknown LoRA target module character: {m_char}")
+    
     base_peft_config_dict = {
-        "r": args.lora_r,
-        "lora_alpha": args.lora_alpha,
-        "target_modules": lora_target_modules,
-        "lora_dropout": args.lora_dropout,
-        "bias": "none",
-        # "task_type": "CAUSAL_LM" # Often needed for standard PeftConfig
+        "r": args.lora_r, "lora_alpha": args.lora_alpha,
+        "target_modules": lora_target_modules_list, # Use the parsed list
+        "lora_dropout": args.lora_dropout, "bias": "none",
     }
 
     if use_unsloth_flag:
         peft_config_to_pass = base_peft_config_dict
     else:
-        # For standard Transformers, create LoraConfig object
-        # task_type is crucial for PeftModel with HF
+        if LoraConfig is None: raise ImportError("LoraConfig not imported for HF mode.")
         peft_config_to_pass = LoraConfig(**base_peft_config_dict, task_type="CAUSAL_LM")
-
-    # --- Calculate num_training_steps for scheduler ---
-    # This is the total number of optimizer steps across all epochs
-    num_optimizer_steps_per_epoch = math.ceil(len(train_loader) / args.accumulate_grad_batches)
-    num_training_steps = num_optimizer_steps_per_epoch * args.epochs
 
     # --- Model Instantiation ---
     llm_model_path = MODEL_NAMES.get(
@@ -262,54 +262,163 @@ def main():
         model_save_path_parts.append("no_unsloth")
     model_save_path = "_".join(model_save_path_parts)
 
-    if args.method == "gumbel":
-        optimizer_params = {"lr": args.lr}
-        scheduler_params = {
-            "num_warmup_steps": args.warmup_steps,
-            "num_training_steps": num_training_steps
-        }
+    steg_module_class = GumbelSteganographer if use_unsloth_flag else GumbelSteganographerHF
+    steg_module_args = {
+        "llm_model_name": llm_model_path,
+        "sim_model_name": args.sim_model,
+        "lora_config": peft_config_to_pass,
+        "temperature": args.temp,
+        "lambda_sim": args.lambda_sim,
+        "model_save_path_prefix": model_save_path,
+        "debug": args.debug,
+    }
+    steg_module = steg_module_class(**steg_module_args).to(device)
 
-        common_steg_args = {
-            "llm_model_name": llm_model_path,
-            "sim_model_name": args.sim_model,
-            "lora_config": peft_config_to_pass,
-            "temperature": args.temp,
-            "lambda_sim": args.lambda_sim,
-            "optimizer_args": optimizer_params,
-            "scheduler_args": scheduler_params,
-            "model_save_path_prefix": model_save_path,
-            "debug": args.debug,
-        }
-
-        if use_unsloth_flag:
-            steg_module = GumbelSteganographer(**common_steg_args)
-        else:
-            steg_module = GumbelSteganographerHF(**common_steg_args)
-
-    elif args.method == "rl":
-        print("RL method not yet implemented.")
-        return
-    else:
-        raise ValueError(f"Unknown method: {args.method}")
-
-    # --- Training with PyTorch Lightning Trainer ---
-    print(
-        f"Starting training with PyTorch Lightning for method: {args.method} with model: {args.model} on dataset: {args.dataset_name}"
-    )
-    if args.no_unsloth:
-        print("Note: Running WITHOUT Unsloth optimizations, using Hugging Face Transformers.")
-
-    trainer = pl.Trainer(
-        max_epochs=args.epochs,
-        logger=logger,
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=1,
-        accumulate_grad_batches=args.accumulate_grad_batches,
+    # --- Optimizer and Scheduler --- 
+    # Optimizer args were part of GumbelSteganographer in PL, now we define them here.
+    optimizer = torch.optim.AdamW(steg_module.model.parameters(), lr=args.lr) 
+    
+    num_training_steps = math.ceil(len(train_loader) / args.accumulate_grad_batches) * args.epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=num_training_steps
     )
 
-    trainer.fit(steg_module, train_loader, val_loader)
+    print(f"Starting training (manual PyTorch loop) for method: {args.method}...")
 
+    # --- Training Loop ---
+    global_step = 0
+    for epoch in range(args.epochs):
+        steg_module.train() # Set model to training mode
+        epoch_train_loss = 0
+        epoch_train_bit_loss = 0
+        epoch_train_sim_loss = 0
+        
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} Training", leave=False)
+        for batch_idx, batch in enumerate(progress_bar):
+            buffers, bits = batch
+            bits = bits.to(device) # Move bits to device
+
+            # Forward pass through GumbelSteganographer's compute_loss method
+            total_loss, loss_bit, loss_sim, intermediate_encoded_texts = steg_module.compute_loss(buffers, bits, device)
+
+            # Normalize loss for gradient accumulation
+            if args.accumulate_grad_batches > 1:
+                total_loss = total_loss / args.accumulate_grad_batches
+            
+            total_loss.backward()
+
+            if (batch_idx + 1) % args.accumulate_grad_batches == 0 or (batch_idx + 1) == len(train_loader):
+                optimizer.step()
+                scheduler.step() # Scheduler steps with optimizer
+                optimizer.zero_grad()
+            
+            epoch_train_loss += total_loss.item() * args.accumulate_grad_batches if args.accumulate_grad_batches > 1 else total_loss.item()
+            epoch_train_bit_loss += loss_bit.item()
+            epoch_train_sim_loss += loss_sim.item()
+
+            if not args.debug:
+                wandb.log({
+                    "train/step_loss": total_loss.item() * args.accumulate_grad_batches if args.accumulate_grad_batches > 1 else total_loss.item(),
+                    "train/step_bit_loss": loss_bit.item(),
+                    "train/step_sim_loss": loss_sim.item(),
+                    "learning_rate": scheduler.get_last_lr()[0],
+                    "global_step": global_step
+                })
+            
+            progress_bar.set_postfix({
+                "loss": f"{total_loss.item():.4f}", 
+                "bit_l": f"{loss_bit.item():.4f}", 
+                "sim_l": f"{loss_sim.item():.4f}"
+            })
+            global_step += 1
+
+            if args.debug and global_step % 10 == 0 and batch_idx % args.accumulate_grad_batches == 0:
+                print(f"--- Training Step {global_step} (Epoch {epoch+1}, Batch {batch_idx+1}) ---")
+                print(f'Buffer: {buffers[0]}')
+                print(f'Encoded (for DECODE): {intermediate_encoded_texts[0]}')
+                print(f"Target Bit: {bits[0].item()}") # Assuming bits is a tensor
+                # For predicted bit, we need to run inference part
+                # This might be too slow for every debug step, but for illustration:
+                with torch.no_grad():
+                    steg_module.eval() # Set to eval for this prediction
+                    predicted_bits_texts_log = steg_module.predict_bits_from_encoded_text(intermediate_encoded_texts[0], device=device)
+                    steg_module.train() # Set back to train
+                print(f"Predicted Bit (by DECODE part): {predicted_bits_texts_log}\n")
+
+        avg_train_loss = epoch_train_loss / len(train_loader)
+        avg_train_bit_loss = epoch_train_bit_loss / len(train_loader)
+        avg_train_sim_loss = epoch_train_sim_loss / len(train_loader)
+        print(f"Epoch {epoch+1} Avg Train Loss: {avg_train_loss:.4f}, Avg Bit Loss: {avg_train_bit_loss:.4f}, Avg Sim Loss: {avg_train_sim_loss:.4f}")
+        if not args.debug:
+            wandb.log({
+                "train/epoch_loss": avg_train_loss,
+                "train/epoch_bit_loss": avg_train_bit_loss,
+                "train/epoch_sim_loss": avg_train_sim_loss,
+                "epoch": epoch + 1
+            })
+
+        # --- Validation Loop ---
+        if val_loader:
+            steg_module.eval() # Set model to evaluation mode
+            val_outputs = []
+            epoch_val_bit_accuracy_sum = 0
+            num_val_samples_processed = 0
+
+            val_progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} Validation", leave=False)
+            with torch.no_grad():
+                for val_batch in val_progress_bar:
+                    val_buffers, val_bits = val_batch
+                    # val_bits = val_bits.to(device) # Already tensor, move to device
+
+                    for i in range(len(val_buffers)):
+                        buf = val_buffers[i]
+                        target_bit_val = val_bits[i].item()
+
+                        # Ensure generation and prediction happen on the correct device
+                        encoded_text_list = steg_module.generate_encoded_text_or_embeddings(
+                            buf, target_bit_val, produce_embeddings=False, device=device
+                        )
+                        encoded_text = encoded_text_list # It returns a list with one item or single string
+                        if isinstance(encoded_text, list): encoded_text = encoded_text[0]
+                        
+                        predicted_bit_text_list = steg_module.predict_bits_from_encoded_text(encoded_text, device=device)
+                        predicted_bit_text = predicted_bit_text_list
+                        if isinstance(predicted_bit_text, list): predicted_bit_text = predicted_bit_text[0]
+
+                        processed_predicted_bit = "UNK"
+                        if predicted_bit_text == "0": processed_predicted_bit = "0"
+                        elif predicted_bit_text == "1": processed_predicted_bit = "1"
+                        
+                        is_correct = (str(target_bit_val) == processed_predicted_bit)
+                        epoch_val_bit_accuracy_sum += 1 if is_correct else 0
+                        num_val_samples_processed +=1
+
+                        val_outputs.append({
+                            "buffer": buf, "encoded_sentence": encoded_text,
+                            "decoded_bit": processed_predicted_bit, "target_bit": str(target_bit_val)
+                        })
+            
+            avg_val_bit_accuracy = (epoch_val_bit_accuracy_sum / num_val_samples_processed) * 100 if num_val_samples_processed > 0 else 0
+            print(f"Epoch {epoch+1} Validation Bit Accuracy: {avg_val_bit_accuracy:.2f}%")
+
+            if not args.debug:
+                wandb.log({"val/bit_accuracy": avg_val_bit_accuracy, "epoch": epoch + 1})
+                # Log table of examples (careful with large validation sets)
+                # Log a subset if too large, e.g., val_outputs[:50]
+                wandb_table_data = [[item["buffer"], item["encoded_sentence"], item["decoded_bit"], item["target_bit"]] for item in val_outputs[:min(len(val_outputs), 100)]]
+                wandb_table = wandb.Table(columns=["buffer", "encoded_sentence", "decoded_bit", "target_bit"], data=wandb_table_data)
+                wandb.log({f"val/epoch_{epoch+1}_examples": wandb_table})
+            else: # Debug mode: print some validation examples
+                print(f"--- Validation Epoch {epoch+1} Examples (first few) ---")
+                for output in val_outputs[:min(len(val_outputs), 5)]:
+                    print(f'Buffer: "{output["buffer"]}" Target: {output["target_bit"]} Encoded: "{output["encoded_sentence"]}" Decoded: {output["decoded_bit"]}')
+    
+    # --- End of Training --- 
     print("Training complete.")
+    steg_module.save_model() # Call the save method from the module
+
+    if not args.debug:
+        wandb.finish()
 
 
 if __name__ == "__main__":
