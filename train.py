@@ -7,6 +7,8 @@ from pytorch_lightning.loggers import WandbLogger
 import math
 
 from gumbel import GumbelSteganographer
+# Conditionally import GumbelSteganographerHF and LoraConfig
+# LoraConfig will be imported later if no_unsloth is true
 
 MODEL_NAMES = {
     "llama": "unsloth/Llama-3.2-3B-Instruct",
@@ -48,6 +50,11 @@ def main():
         "--debug",
         action="store_true",
         help="Disable wandb and print more logs to terminal.",
+    )
+    parser.add_argument(
+        "--no_unsloth",
+        action="store_true",
+        help="Disable Unsloth and use standard Transformers for model loading.",
     )
     parser.add_argument(
         "--model",
@@ -139,6 +146,15 @@ def main():
     args = parser.parse_args()
 
     dataset_path = AVAILABLE_DATASETS[args.dataset_name]
+    use_unsloth_flag = not args.no_unsloth
+
+    # Import HF specific modules if not using unsloth
+    if not use_unsloth_flag:
+        from gumbel_hf import GumbelSteganographerHF
+        from peft import LoraConfig
+    else:
+        # Ensure GumbelSteganographer is available from the initial import
+        pass 
 
     logger = None
     if not args.debug:
@@ -153,6 +169,8 @@ def main():
         ]
         if args.sample_fraction < 1.0:
             run_name_parts.append(f"sf{args.sample_fraction}")
+        if args.no_unsloth:
+            run_name_parts.append("no_unsloth")
         if args.accumulate_grad_batches > 1:
             run_name_parts.append(f"acc{args.accumulate_grad_batches}")
         run_name = "_".join(run_name_parts)
@@ -162,6 +180,8 @@ def main():
         print(
             "DEBUG mode enabled: wandb logging is OFF. Validation and some training logs will print to terminal."
         )
+        if args.no_unsloth:
+            print("Unsloth is DISABLED for model loading. Using Hugging Face Transformers.")
 
     # --- Dataset and DataLoaders ---
     try:
@@ -220,8 +240,12 @@ def main():
         # "task_type": "CAUSAL_LM" # Often needed for standard PeftConfig
     }
 
-    # Always use Unsloth, so peft_config_to_pass is always base_peft_config_dict
-    peft_config_to_pass = base_peft_config_dict
+    if use_unsloth_flag:
+        peft_config_to_pass = base_peft_config_dict
+    else:
+        # For standard Transformers, create LoraConfig object
+        # task_type is crucial for PeftModel with HF
+        peft_config_to_pass = LoraConfig(**base_peft_config_dict, task_type="CAUSAL_LM")
 
     # --- Calculate num_training_steps for scheduler ---
     # This is the total number of optimizer steps across all epochs
@@ -238,6 +262,8 @@ def main():
         args.model,
         f"ds-{args.dataset_name}",
     ]
+    if args.no_unsloth:
+        model_save_path_parts.append("no_unsloth")
     model_save_path = "_".join(model_save_path_parts)
 
     if args.method == "gumbel":
@@ -247,17 +273,23 @@ def main():
             "num_training_steps": num_training_steps
         }
 
-        steg_module = GumbelSteganographer(
-            llm_model_name=llm_model_path,
-            sim_model_name=args.sim_model,
-            lora_config=peft_config_to_pass,
-            temperature=args.temp,
-            lambda_sim=args.lambda_sim,
-            optimizer_args=optimizer_params,
-            scheduler_args=scheduler_params,
-            model_save_path_prefix=model_save_path,
-            debug=args.debug,
-        )
+        common_steg_args = {
+            "llm_model_name": llm_model_path,
+            "sim_model_name": args.sim_model,
+            "lora_config": peft_config_to_pass,
+            "temperature": args.temp,
+            "lambda_sim": args.lambda_sim,
+            "optimizer_args": optimizer_params,
+            "scheduler_args": scheduler_params,
+            "model_save_path_prefix": model_save_path,
+            "debug": args.debug,
+        }
+
+        if use_unsloth_flag:
+            steg_module = GumbelSteganographer(**common_steg_args)
+        else:
+            steg_module = GumbelSteganographerHF(**common_steg_args)
+
     elif args.method == "rl":
         print("RL method not yet implemented.")
         return
@@ -268,6 +300,8 @@ def main():
     print(
         f"Starting training with PyTorch Lightning for method: {args.method} with model: {args.model} on dataset: {args.dataset_name}"
     )
+    if args.no_unsloth:
+        print("Note: Running WITHOUT Unsloth optimizations, using Hugging Face Transformers.")
 
     trainer = pl.Trainer(
         max_epochs=args.epochs,
