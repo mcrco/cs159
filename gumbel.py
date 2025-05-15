@@ -36,7 +36,7 @@ class GumbelSteganographer(pl.LightningModule):
         print("Using Unsloth for model loading.")
         self.model, self.tokenizer = FastLanguageModel.from_pretrained(
             model_name=llm_model_name,
-            max_seq_length=2048,
+            max_seq_length=1024,
             dtype=None,
             load_in_4bit=True,
             device_map="auto",

@@ -1,3 +1,4 @@
+import unsloth
 import argparse
 import torch
 from torch.utils.data import DataLoader
@@ -5,10 +6,6 @@ from datasets import load_from_disk
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 import math
-
-from gumbel import GumbelSteganographer
-# Conditionally import GumbelSteganographerHF and LoraConfig
-# LoraConfig will be imported later if no_unsloth is true
 
 MODEL_NAMES = {
     "llama": "unsloth/Llama-3.2-3B-Instruct",
@@ -153,8 +150,7 @@ def main():
         from gumbel_hf import GumbelSteganographerHF
         from peft import LoraConfig
     else:
-        # Ensure GumbelSteganographer is available from the initial import
-        pass 
+        from gumbel import GumbelSteganographer
 
     logger = None
     if not args.debug:
