@@ -1,21 +1,9 @@
-import os
-
-if os.environ.get("NO_UNSLOTH", "false") == "false":
-    from unsloth import FastLanguageModel
-    from unsloth.chat_templates import get_chat_template as unsloth_get_chat_template
-else:
-    print("unsloth is disabled")
-
+from unsloth import FastLanguageModel
+from unsloth.chat_templates import get_chat_template as unsloth_get_chat_template
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 import wandb
-
-# Standard Hugging Face imports
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from peft import (
-    get_peft_model as hf_get_peft_model,
-)  # Renamed to avoid conflict if PeftModel is also imported directly
 from transformers.optimization import get_linear_schedule_with_warmup
 from sentence_transformers import SentenceTransformer, util
 
@@ -36,56 +24,34 @@ class GumbelSteganographer(pl.LightningModule):
         scheduler_args,
         model_save_path_prefix,
         debug=False,
-        use_unsloth: bool = True,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
 
-        self.use_unsloth = use_unsloth
         self.model_name_for_chat_template = (
             llm_model_name
         )
 
-        if self.use_unsloth:
-            print("Using Unsloth for model loading.")
-            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-                model_name=llm_model_name,
-                max_seq_length=2048,
-                dtype=None,
-                load_in_4bit=True,
-                device_map="auto",
-            )
-            self.model = FastLanguageModel.get_peft_model(self.model, **lora_config)
-        else:
-            print("Using standard Hugging Face Transformers for model loading.")
-            self.tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16
-                if torch.cuda.is_bf16_supported()
-                else torch.float16,
-                bnb_4bit_use_double_quant=False,
-            )
-            self.model = AutoModelForCausalLM.from_pretrained(
-                llm_model_name,
-                quantization_config=bnb_config,
-                device_map="auto",
-            )
-            self.model = hf_get_peft_model(self.model, lora_config)
-            self.model.print_trainable_parameters()
+        # Always use Unsloth for model loading
+        print("Using Unsloth for model loading.")
+        self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+            model_name=llm_model_name,
+            max_seq_length=2048,
+            dtype=None,
+            load_in_4bit=True,
+            device_map="auto",
+        )
+        self.model = FastLanguageModel.get_peft_model(self.model, **lora_config)
 
-        if self.use_unsloth:
-            if "llama" in self.model_name_for_chat_template.lower():
-                self.tokenizer = unsloth_get_chat_template(self.tokenizer, chat_template="llama-3.1")
-            elif "qwen" in self.model_name_for_chat_template.lower():
-                self.tokenizer = unsloth_get_chat_template(self.tokenizer, chat_template="qwen-2.5")
-            elif "gemma" in self.model_name_for_chat_template.lower():
-                self.tokenizer = unsloth_get_chat_template(self.tokenizer, chat_template="gemma-3")
-            elif "olmo" in self.model_name_for_chat_template.lower():
-                self.tokenizer = unsloth_get_chat_template(self.tokenizer, chat_template="olmo")
-        else:
-            print("Relying on tokenizer's default chat template or pre-configuration for non-Unsloth mode.")
+        # Always use Unsloth chat templates
+        if "llama" in self.model_name_for_chat_template.lower():
+            self.tokenizer = unsloth_get_chat_template(self.tokenizer, chat_template="llama-3.1")
+        elif "qwen" in self.model_name_for_chat_template.lower():
+            self.tokenizer = unsloth_get_chat_template(self.tokenizer, chat_template="qwen-2.5")
+        elif "gemma" in self.model_name_for_chat_template.lower():
+            self.tokenizer = unsloth_get_chat_template(self.tokenizer, chat_template="gemma-3")
+        elif "olmo" in self.model_name_for_chat_template.lower():
+            self.tokenizer = unsloth_get_chat_template(self.tokenizer, chat_template="olmo")
 
         if self.tokenizer.pad_token is None:
             print("Tokenizer does not have a pad_token, setting it to eos_token.")

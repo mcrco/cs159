@@ -7,7 +7,6 @@ from pytorch_lightning.loggers import WandbLogger
 import math
 
 from gumbel import GumbelSteganographer
-from peft import LoraConfig
 
 MODEL_NAMES = {
     "llama": "unsloth/Llama-3.2-3B-Instruct",
@@ -49,11 +48,6 @@ def main():
         "--debug",
         action="store_true",
         help="Disable wandb and print more logs to terminal.",
-    )
-    parser.add_argument(
-        "--no_unsloth",
-        action="store_true",
-        help="Disable Unsloth and use standard Transformers for model loading.",
     )
     parser.add_argument(
         "--model",
@@ -145,7 +139,6 @@ def main():
     args = parser.parse_args()
 
     dataset_path = AVAILABLE_DATASETS[args.dataset_name]
-    use_unsloth_flag = not args.no_unsloth
 
     logger = None
     if not args.debug:
@@ -160,8 +153,6 @@ def main():
         ]
         if args.sample_fraction < 1.0:
             run_name_parts.append(f"sf{args.sample_fraction}")
-        if args.no_unsloth:
-            run_name_parts.append("no_unsloth")
         if args.accumulate_grad_batches > 1:
             run_name_parts.append(f"acc{args.accumulate_grad_batches}")
         run_name = "_".join(run_name_parts)
@@ -171,8 +162,6 @@ def main():
         print(
             "DEBUG mode enabled: wandb logging is OFF. Validation and some training logs will print to terminal."
         )
-        if args.no_unsloth:
-            print("Unsloth is DISABLED for model loading.")
 
     # --- Dataset and DataLoaders ---
     try:
@@ -231,13 +220,8 @@ def main():
         # "task_type": "CAUSAL_LM" # Often needed for standard PeftConfig
     }
 
-    if use_unsloth_flag:
-        peft_config_to_pass = base_peft_config_dict
-        # Unsloth's FastLanguageModel.get_peft_model might not need task_type explicitly,
-        # or handles it internally. If issues arise, it can be removed from dict for Unsloth.
-    else:
-        # For standard Transformers, create LoraConfig object
-        peft_config_to_pass = LoraConfig(**base_peft_config_dict, task_type="CAUSAL_LM")
+    # Always use Unsloth, so peft_config_to_pass is always base_peft_config_dict
+    peft_config_to_pass = base_peft_config_dict
 
     # --- Calculate num_training_steps for scheduler ---
     # This is the total number of optimizer steps across all epochs
@@ -254,8 +238,6 @@ def main():
         args.model,
         f"ds-{args.dataset_name}",
     ]
-    if args.no_unsloth:
-        model_save_path_parts.append("no_unsloth")
     model_save_path = "_".join(model_save_path_parts)
 
     if args.method == "gumbel":
@@ -275,7 +257,6 @@ def main():
             scheduler_args=scheduler_params,
             model_save_path_prefix=model_save_path,
             debug=args.debug,
-            use_unsloth=use_unsloth_flag,
         )
     elif args.method == "rl":
         print("RL method not yet implemented.")
@@ -287,8 +268,6 @@ def main():
     print(
         f"Starting training with PyTorch Lightning for method: {args.method} with model: {args.model} on dataset: {args.dataset_name}"
     )
-    if args.no_unsloth:
-        print("Note: Running WITHOUT Unsloth optimizations.")
 
     trainer = pl.Trainer(
         max_epochs=args.epochs,
