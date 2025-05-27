@@ -2,7 +2,7 @@ from unsloth import FastLanguageModel
 from unsloth.chat_templates import get_chat_template as unsloth_get_chat_template
 import torch
 import torch.nn.functional as F
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import util
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -13,26 +13,22 @@ class GumbelSteganographer(torch.nn.Module):
     def __init__(
         self,
         llm_model_name: str,
-        sim_model_name: str,
         lora_config: dict,
         temperature: float,
-        lambda_sim: float,
         model_save_path_prefix: str,
         debug: bool = False,
     ) -> None:
         super().__init__()
 
         self.llm_model_name = llm_model_name
-        self.sim_model_name = sim_model_name
         self.lora_config = lora_config
         self.temperature = float(temperature)
-        self.lambda_sim = float(lambda_sim)
         self.model_save_path_prefix = model_save_path_prefix
         self.debug = debug
 
         self.model_name_for_chat_template = llm_model_name
 
-        print("Using Unsloth for model loading.")
+        print("Using Unsloth for trainable model loading.")
         self.model, self.tokenizer = FastLanguageModel.from_pretrained(
             model_name=self.llm_model_name,
             max_seq_length=1024,
@@ -41,6 +37,7 @@ class GumbelSteganographer(torch.nn.Module):
         )
         self.model = FastLanguageModel.get_peft_model(self.model, **self.lora_config)
 
+        # Setup tokenizer specific chat templates if needed
         if "llama" in self.model_name_for_chat_template.lower():
             self.tokenizer = unsloth_get_chat_template(self.tokenizer, chat_template="llama-3.1")
         elif "qwen" in self.model_name_for_chat_template.lower():
@@ -51,16 +48,27 @@ class GumbelSteganographer(torch.nn.Module):
             self.tokenizer = unsloth_get_chat_template(self.tokenizer, chat_template="olmo")
 
         if self.tokenizer.pad_token is None:
-            print("Tokenizer does not have a pad_token, setting it to eos_token.")
+            print("Trainable model tokenizer does not have a pad_token, setting it to eos_token.")
             self.tokenizer.pad_token = self.tokenizer.eos_token
-            if self.model.config.pad_token_id is None:
+            if self.model.config.pad_token_id is None: # Ensure the model config also reflects this
                 self.model.config.pad_token_id = self.tokenizer.eos_token_id
 
-        self.sim_model = SentenceTransformer(self.sim_model_name, device=DEVICE)
-        print("Setting sim_model to eval mode and freezing parameters.")
-        self.sim_model.eval()
-        for param in self.sim_model.parameters():
+        print("Loading separate, frozen model for embeddings.")
+        # Load the base model again for embeddings, without PEFT adapters and frozen
+        # We use the same tokenizer that was potentially modified for chat templates,
+        # as it's primarily for tokenizing input text.
+        # The embedding model itself won't use the chat template logic for its forward pass.
+        self.embedding_model, _ = FastLanguageModel.from_pretrained( # Tokenizer is not needed again or can use self.tokenizer
+            model_name=self.llm_model_name, # Use the same base model
+            max_seq_length=1024,
+            dtype=None, # Or specify a preferred dtype for inference, e.g., torch.float16
+            load_in_4bit=True, # Or False if memory allows and precision is critical for embeddings
+        )
+        # DO NOT apply PEFT to self.embedding_model
+        self.embedding_model.eval()
+        for param in self.embedding_model.parameters():
             param.requires_grad = False
+        print("Frozen embedding model loaded and set to eval mode with gradients disabled.")
 
         self.zero_id = self.tokenizer.convert_tokens_to_ids("0")
         self.one_id = self.tokenizer.convert_tokens_to_ids("1")
@@ -75,6 +83,66 @@ class GumbelSteganographer(torch.nn.Module):
             "pad_token_id": self.tokenizer.pad_token_id,
         }
         self.generation_length_margin = 10
+
+    def _get_llm_embeddings(
+        self,
+        texts: list[str] | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None, # Should be provided if inputs_embeds might be padded or need specific attention
+        device: torch.device = torch.device(DEVICE)
+    ) -> torch.Tensor:
+        # This method now uses self.embedding_model which is always frozen and in eval mode.
+        # No need to manage self.model.training state here.
+        
+        # Determine max_length for tokenizer
+        tokenizer_max_length = self.tokenizer.model_max_length if hasattr(self.tokenizer, 'model_max_length') and self.tokenizer.model_max_length else self.embedding_model.config.max_seq_length
+
+        if texts is not None:
+            inputs = self.tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=tokenizer_max_length,
+            ).to(device)
+            
+            # Use the frozen embedding_model
+            outputs = self.embedding_model(
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                output_hidden_states=True,
+            )
+            last_hidden_states = outputs.hidden_states[-1]
+            
+            input_mask_expanded = inputs.attention_mask.unsqueeze(-1).expand(last_hidden_states.size()).float()
+            sum_hidden_states = torch.sum(last_hidden_states * input_mask_expanded, 1)
+            sum_mask = input_mask_expanded.sum(1)
+            sum_mask = torch.clamp(sum_mask, min=1e-9)
+            pooled_embeddings = sum_hidden_states / sum_mask
+            return pooled_embeddings
+
+        elif inputs_embeds is not None:
+            if attention_mask is None:
+                attention_mask = torch.ones(inputs_embeds.shape[0], inputs_embeds.shape[1], device=device, dtype=torch.long)
+            
+            attention_mask = attention_mask.to(device)
+
+            # Use the frozen embedding_model
+            outputs = self.embedding_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+            last_hidden_states = outputs.hidden_states[-1]
+
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_states.size()).float()
+            sum_hidden_states = torch.sum(last_hidden_states * input_mask_expanded, 1)
+            sum_mask = input_mask_expanded.sum(1)
+            sum_mask = torch.clamp(sum_mask, min=1e-9)
+            pooled_embeddings = sum_hidden_states / sum_mask
+            return pooled_embeddings
+        else:
+            raise ValueError("Either texts or inputs_embeds must be provided to _get_llm_embeddings.")
 
     def _prepare_encode_prompts(
         self, buffers: list[str], bits_to_hide: list[int]
@@ -132,6 +200,7 @@ class GumbelSteganographer(torch.nn.Module):
             # Initial prompt processing
             prompt_input_ids = enc_inputs_dict["input_ids"]
             current_attention_mask = enc_inputs_dict["attention_mask"]
+            batch_size = prompt_input_ids.shape[0]
             
             # Convert initial prompt IDs to embeddings
             current_input_embeds = self.model.get_input_embeddings()(prompt_input_ids)
@@ -141,10 +210,22 @@ class GumbelSteganographer(torch.nn.Module):
             list_generated_hard_ids = []  # These are for text for loss_sim
             num_tokens_to_generate = dynamic_generation_length
 
+            accumulated_token_penalty = torch.tensor(0.0, device=device, dtype=torch.float32)
+
             for _ in range(num_tokens_to_generate):
                 # Model takes embeddings directly now
                 model_outputs = self.model(inputs_embeds=current_input_embeds, attention_mask=current_attention_mask)
                 next_token_logits = model_outputs.logits[:, -1, :]
+
+                # Calculate penalty for "0" and "1" logits for this step
+                probs = F.softmax(next_token_logits, dim=-1)
+                # Ensure zero_id and one_id are not out of bounds for vocab
+                # This assumes self.zero_id and self.one_id are valid scalar token indices
+                prob_zero = probs[:, self.zero_id] if self.zero_id < probs.shape[-1] else torch.zeros_like(probs[:, 0])
+                prob_one = probs[:, self.one_id] if self.one_id < probs.shape[-1] else torch.zeros_like(probs[:, 0])
+                
+                step_penalty = (prob_zero.sum() + prob_one.sum()) / batch_size # Average over batch
+                accumulated_token_penalty += step_penalty
 
                 # Soft distribution for soft embeddings (used for loss_bit and next input embed)
                 soft_dist_for_next_step = F.gumbel_softmax(next_token_logits, tau=self.temperature, hard=False, dim=-1)
@@ -153,16 +234,8 @@ class GumbelSteganographer(torch.nn.Module):
                 
                 list_generated_soft_embs.append(next_soft_emb_for_output_and_input)
                 
-                # For hard IDs (loss_sim, intermediate text): Choose based on lambda_sim
-                if self.lambda_sim > 0.0:
-                    # Use STE: hard=True for one-hot output, soft for backward pass on this path IF it were used for grads
-                    # For generating hard IDs for loss_sim, STE helps if any part of loss_sim was meant to train the generator via these hard choices.
-                    # However, the primary gradient path for the generator is now through soft_embs.
-                    ste_one_hot_output = F.gumbel_softmax(next_token_logits, tau=self.temperature, hard=True, dim=-1)
-                    hard_id_for_text_gen = torch.argmax(ste_one_hot_output, dim=-1).unsqueeze(1)
-                else:
-                    # No STE needed for loss_sim if lambda_sim is 0, just use argmax on the soft distribution
-                    hard_id_for_text_gen = torch.argmax(soft_dist_for_next_step, dim=-1).unsqueeze(1)
+                ste_one_hot_output = F.gumbel_softmax(next_token_logits, tau=self.temperature, hard=True, dim=-1)
+                hard_id_for_text_gen = torch.argmax(ste_one_hot_output, dim=-1).unsqueeze(1)
                 
                 list_generated_hard_ids.append(hard_id_for_text_gen)
                 
@@ -175,7 +248,10 @@ class GumbelSteganographer(torch.nn.Module):
             final_hard_ids = torch.cat(list_generated_hard_ids, dim=1)
             intermediate_encoded_texts = self.tokenizer.batch_decode(final_hard_ids, skip_special_tokens=True)
             generated_attention_mask = torch.ones_like(final_hard_ids, device=device)
-            return final_soft_embs, intermediate_encoded_texts, generated_attention_mask
+            
+            avg_token_penalty = accumulated_token_penalty / num_tokens_to_generate if num_tokens_to_generate > 0 else torch.tensor(0.0, device=device)
+            
+            return final_soft_embs, intermediate_encoded_texts, generated_attention_mask, avg_token_penalty
         else:
             if generation_max_new_tokens is not None:
                 max_tokens = generation_max_new_tokens
@@ -239,9 +315,9 @@ class GumbelSteganographer(torch.nn.Module):
             stripped_texts = [text.strip() for text in predicted_bit_texts]
             return stripped_texts[0] if was_single_input else stripped_texts
 
-    def compute_loss(self, buffers, bits, device):
+    def compute_loss(self, buffers, bits, device, lambda_sim: float, lambda_penalty: float):
         current_bits_list = bits.tolist()
-        soft_embs, intermediate_encoded_texts, enc_attention_mask = \
+        soft_embs, intermediate_encoded_texts, enc_attention_mask, loss_penalty_from_logits = \
             self.generate_encoded_text_or_embeddings(
                 buffers, current_bits_list, produce_embeddings=True, device=device
             )
@@ -259,15 +335,22 @@ class GumbelSteganographer(torch.nn.Module):
         
         loss_bit = torch.nn.functional.cross_entropy(full_decode_logits, target_token_ids)
 
-        orig_emb = self.sim_model.encode(buffers, convert_to_tensor=True, device=device)
-        enc_emb = self.sim_model.encode(intermediate_encoded_texts, convert_to_tensor=True, device=device)
+        # Get embeddings for original buffers using the LLM
+        orig_emb = self._get_llm_embeddings(texts=buffers, device=device)
+        
+        # Get embeddings for generated soft_embs using the LLM
+        # enc_attention_mask corresponds to soft_embs and indicates valid (non-padded) tokens
+        enc_emb = self._get_llm_embeddings(inputs_embeds=soft_embs, attention_mask=enc_attention_mask, device=device)
         
         sim_scores = util.cos_sim(orig_emb, enc_emb).diag()
         loss_sim = (1 - sim_scores).mean()
 
-        total_loss = loss_bit + self.lambda_sim * loss_sim.to(loss_bit.device)
+        # Use the penalty from logits directly
+        loss_penalty = loss_penalty_from_logits.to(loss_bit.device)
+
+        total_loss = loss_bit + lambda_sim * loss_sim.to(loss_bit.device) + lambda_penalty * loss_penalty
         
-        return total_loss, loss_bit, loss_sim, intermediate_encoded_texts
+        return total_loss, loss_bit, loss_sim, loss_penalty, intermediate_encoded_texts
         
     def save_model(self):
         if not self.debug:

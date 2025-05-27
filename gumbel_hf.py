@@ -131,6 +131,7 @@ class GumbelSteganographerHF(torch.nn.Module):
         if produce_embeddings:
             prompt_input_ids = enc_inputs_dict["input_ids"]
             current_attention_mask = enc_inputs_dict["attention_mask"]
+            batch_size = prompt_input_ids.shape[0]
             current_input_embeds = self.model.get_input_embeddings()(prompt_input_ids)
             
             emb_matrix = self.model.get_input_embeddings().weight
@@ -138,9 +139,19 @@ class GumbelSteganographerHF(torch.nn.Module):
             list_generated_hard_ids = []
             num_tokens_to_generate = dynamic_generation_length
 
+            accumulated_token_penalty = torch.tensor(0.0, device=device, dtype=torch.float32)
+
             for _ in range(num_tokens_to_generate):
                 model_outputs = self.model(inputs_embeds=current_input_embeds, attention_mask=current_attention_mask)
                 next_token_logits = model_outputs.logits[:, -1, :]
+
+                # Calculate penalty for "0" and "1" logits for this step
+                probs = F.softmax(next_token_logits, dim=-1)
+                prob_zero = probs[:, self.zero_id] if self.zero_id < probs.shape[-1] else torch.zeros_like(probs[:, 0])
+                prob_one = probs[:, self.one_id] if self.one_id < probs.shape[-1] else torch.zeros_like(probs[:, 0])
+
+                step_penalty = (prob_zero.sum() + prob_one.sum()) / batch_size # Average over batch
+                accumulated_token_penalty += step_penalty
 
                 soft_dist_for_next_step = F.gumbel_softmax(next_token_logits, tau=self.temperature, hard=False, dim=-1)
                 next_soft_emb_for_output_and_input = torch.matmul(soft_dist_for_next_step.unsqueeze(1).to(emb_matrix.dtype), emb_matrix)
@@ -160,7 +171,10 @@ class GumbelSteganographerHF(torch.nn.Module):
             final_hard_ids = torch.cat(list_generated_hard_ids, dim=1)
             intermediate_encoded_texts = self.tokenizer.batch_decode(final_hard_ids, skip_special_tokens=True)
             generated_attention_mask = torch.ones_like(final_hard_ids, device=device)
-            return final_soft_embs, intermediate_encoded_texts, generated_attention_mask
+
+            avg_token_penalty = accumulated_token_penalty / num_tokens_to_generate if num_tokens_to_generate > 0 else torch.tensor(0.0, device=device)
+
+            return final_soft_embs, intermediate_encoded_texts, generated_attention_mask, avg_token_penalty
         else: # Standard generation
             max_tokens = generation_max_new_tokens if generation_max_new_tokens is not None else dynamic_generation_length
             generated_ids = self.model.generate(
@@ -217,9 +231,9 @@ class GumbelSteganographerHF(torch.nn.Module):
             stripped_texts = [text.strip() for text in predicted_bit_texts]
             return stripped_texts[0] if was_single_input else stripped_texts
 
-    def compute_loss(self, buffers, bits, device):
+    def compute_loss(self, buffers, bits, device, lambda_penalty: float):
         current_bits_list = bits.tolist()
-        soft_embs, intermediate_encoded_texts, enc_attention_mask = \
+        soft_embs, intermediate_encoded_texts, enc_attention_mask, loss_penalty_from_logits = \
             self.generate_encoded_text_or_embeddings(
                 buffers, current_bits_list, produce_embeddings=True, device=device
             )
@@ -243,9 +257,12 @@ class GumbelSteganographerHF(torch.nn.Module):
         sim_scores = util.cos_sim(orig_emb, enc_emb).diag()
         loss_sim = (1 - sim_scores).mean()
 
-        total_loss = loss_bit + self.lambda_sim * loss_sim.to(loss_bit.device)
+        # Use the penalty from logits directly
+        loss_penalty = loss_penalty_from_logits.to(loss_bit.device)
+
+        total_loss = loss_bit + self.lambda_sim * loss_sim.to(loss_bit.device) + lambda_penalty * loss_penalty
         
-        return total_loss, loss_bit, loss_sim, intermediate_encoded_texts
+        return total_loss, loss_bit, loss_sim, loss_penalty, intermediate_encoded_texts
         
     def save_model(self):
         if not self.debug:

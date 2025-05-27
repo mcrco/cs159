@@ -7,9 +7,7 @@ from datasets import load_from_disk
 import math
 import wandb
 from tqdm import tqdm
-import random # For shuffling seeds per epoch
 
-from transformers.optimization import get_linear_schedule_with_warmup
 
 MODEL_NAMES = {
     "llama": "unsloth/Llama-3.2-3B-Instruct",
@@ -21,7 +19,6 @@ MODEL_NAMES = {
     "qwen1.5b": "unsloth/Qwen2.5-1.5B-Instruct",
     "llama1b": "unsloth/Llama-3.2-1B-Instruct",
 }
-SIM_MODEL_NAME = "all-MiniLM-L6-v2"
 
 # Define available datasets and their corresponding path prefixes/suffixes
 AVAILABLE_DATASETS = {
@@ -63,11 +60,6 @@ def main():
         help=f"Base LLM model name. Choices: {list(MODEL_NAMES.keys())}. (default: qwen3b)",
     )
     parser.add_argument(
-        "--sim_model",
-        default=SIM_MODEL_NAME,
-        help=f"Sentence similarity model name (default: {SIM_MODEL_NAME})",
-    )
-    parser.add_argument(
         "--temp",
         type=float,
         default=1.0,
@@ -77,7 +69,25 @@ def main():
         "--lambda_sim",
         type=float,
         default=0.0,
-        help="Weight for similarity loss (if applicable) (default: 0.0)",
+        help="Weight for similarity loss (if applicable). This will be the final value if scheduling is used. (default: 0.0)",
+    )
+    parser.add_argument(
+        "--lambda_sim_initial_value",
+        type=float,
+        default=0.0,
+        help="Initial value for lambda_sim if scheduling is used (default: 0.0)"
+    )
+    parser.add_argument(
+        "--lambda_sim_warmup_steps",
+        type=int,
+        default=500,
+        help="Number of optimizer steps to warmup lambda_sim from initial to final value (default: 500)"
+    )
+    parser.add_argument(
+        "--lambda_penalty",
+        type=float,
+        default=0.1,
+        help="Weight for the penalty loss if encoded text contains '0' or '1'. (default: 0.1)",
     )
     parser.add_argument(
         "--epochs", type=int, default=1, help="Number of training epochs (default: 1)"
@@ -98,19 +108,13 @@ def main():
         help="Learning rate for the optimizer (default: 1e-4)",
     )
     parser.add_argument(
-        "--warmup_steps",
-        type=int,
-        default=500,
-        help="Number of warmup steps for the scheduler (default: 500)",
-    )
-    parser.add_argument(
         "--lora_r", type=int, default=8, help="LoRA r parameter (default: 8)"
     )
     parser.add_argument(
         "--lora_alpha", type=int, default=32, help="LoRA alpha parameter (default: 32)"
     )
     parser.add_argument(
-        "--lora_dropout", type=float, default=0.1, help="LoRA dropout (default: 0.1)"
+        "--lora_dropout", type=float, default=0.0, help="LoRA dropout (default: 0.0)"
     )
     parser.add_argument(
         "--lora_target_modules",
@@ -172,7 +176,10 @@ def main():
             args.model,
             f"ds-{args.dataset_name}",
             f"t{args.temp}",
-            f"ls{args.lambda_sim}",
+            f"ls_init{args.lambda_sim_initial_value}",
+            f"ls_final{args.lambda_sim}",
+            f"ls_warm_steps{args.lambda_sim_warmup_steps}",
+            f"lp{args.lambda_penalty}",
             f"e{args.epochs}",
             f"lr{args.lr}"
         ]
@@ -250,7 +257,7 @@ def main():
         
         test_loader = DataLoader(
             test_dataset_to_use,
-            batch_size=args.val_batch_size, # Use val_batch_size for test loader as well
+            batch_size=args.val_batch_size, 
             shuffle=False,
             collate_fn=collate_fn,
             num_workers=4
@@ -259,7 +266,21 @@ def main():
         # Placeholders, will be set in epoch loop
         train_loader = None 
         val_loader = None
-        test_loader = None # Will be set after epoch loop based on full test dataset if sample_per_epoch
+        # test_loader = None # Will be set after epoch loop based on full test dataset if sample_per_epoch 
+        # Test loader should be defined once based on full test data if sample_per_epoch is false
+        # Or if sample_per_epoch is true, it's initialized after all epochs based on the full test set.
+        # The original logic: if not args.sample_per_epoch, test_loader is init. If sample_per_epoch, it's placeholder.
+        # It should be initialized ONCE using test_dataset_to_use.
+        # Let's ensure test_loader is initialized if test_dataset_to_use exists, outside the epoch loop if not sample_per_epoch.
+        # And after the epoch loop if sample_per_epoch (which is already the case). This part seems okay.
+
+        test_loader = DataLoader(
+            test_dataset_to_use,
+            batch_size=args.val_batch_size, 
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=4
+        ) if test_dataset_to_use and len(test_dataset_to_use) > 0 else None
 
     # --- PEFT Configuration ---
     lora_target_modules_list = []
@@ -305,13 +326,15 @@ def main():
     steg_module_class = GumbelSteganographer if use_unsloth_flag else GumbelSteganographerHF
     steg_module_args = {
         "llm_model_name": llm_model_path,
-        "sim_model_name": args.sim_model,
         "lora_config": peft_config_to_pass,
         "temperature": args.temp,
-        "lambda_sim": args.lambda_sim,
         "model_save_path_prefix": model_save_path,
         "debug": args.debug,
     }
+    if not use_unsloth_flag: # If GumbelSteganographerHF
+        steg_module_args["lambda_sim"] = args.lambda_sim # It expects lambda_sim in init
+        steg_module_args["sim_model_name"] = "sentence-transformers/all-MiniLM-L6-v2" # Example, ensure this is appropriate or configurable
+
     steg_module = steg_module_class(**steg_module_args).to(device)
 
     # --- Optimizer and Scheduler --- 
@@ -324,9 +347,11 @@ def main():
     global_step = 0
     for epoch in range(args.epochs):
         steg_module.train() # Set model to training mode
+
         epoch_total_loss_sum = 0 
         epoch_bit_loss_sum = 0   
         epoch_sim_loss_sum = 0  
+        epoch_penalty_loss_sum = 0
         num_optimizer_steps_this_epoch = 0
         num_micro_batches_processed_epoch = 0
 
@@ -360,31 +385,51 @@ def main():
 
         if epoch == 0 or args.sample_per_epoch: # Calculate scheduler steps based on current train_loader
             num_optimizer_steps_per_epoch = math.ceil(len(train_loader) / args.accumulate_grad_batches)
-            num_total_optimizer_steps_for_scheduler = num_optimizer_steps_per_epoch * args.epochs # Or adjust if dynamic
-            if args.sample_per_epoch:
-                 # If sampling per epoch, total steps for scheduler might be an estimate or based on first epoch
-                 # For simplicity, let's base it on the current epoch's loader for all epochs when sampling per epoch
-                 # Or, more accurately, sum of optimizer steps across all planned epochs if lengths vary wildly.
-                 # Let's assume for now that sample_fraction keeps loader length relatively constant for scheduler purposes.
-                 num_total_optimizer_steps_for_scheduler = num_optimizer_steps_per_epoch * args.epochs
-            else: # If not sampling per epoch, this was calculated once outside
-                 num_total_optimizer_steps_for_scheduler = math.ceil(len(train_loader) / args.accumulate_grad_batches) * args.epochs
+            # num_total_optimizer_steps_for_scheduler = num_optimizer_steps_per_epoch * args.epochs # Or adjust if dynamic
+            # if args.sample_per_epoch:
+            #      num_total_optimizer_steps_for_scheduler = num_optimizer_steps_per_epoch * args.epochs
+            # else: 
+            #      num_total_optimizer_steps_for_scheduler = math.ceil(len(train_loader) / args.accumulate_grad_batches) * args.epochs
+            # Removed scheduler-specific calculations
 
-            scheduler = get_linear_schedule_with_warmup(
-                optimizer, num_warmup_steps=args.warmup_steps, 
-                num_training_steps=num_total_optimizer_steps_for_scheduler
-            )
-            print(f"Scheduler re/initialized. Optimizer steps per epoch: {num_optimizer_steps_per_epoch}, Total for scheduler: {num_total_optimizer_steps_for_scheduler}")
+            # scheduler = get_linear_schedule_with_warmup( # Removed scheduler initialization
+            #     optimizer, num_warmup_steps=args.warmup_steps, 
+            #     num_training_steps=num_total_optimizer_steps_for_scheduler
+            # )
+            # print(f"Scheduler re/initialized. Optimizer steps per epoch: {num_optimizer_steps_per_epoch}, Total for scheduler: {num_total_optimizer_steps_for_scheduler}")
+            print(f"Optimizer steps per epoch (estimated for current loader): {num_optimizer_steps_per_epoch}")
 
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} Training", leave=False)
         for batch_idx, batch_data in enumerate(progress_bar):
             buffers, bits = batch_data 
             bits_on_device = bits.to(device)
 
-            loss, bit_loss, sim_loss, intermediate_encoded_texts = steg_module.compute_loss(buffers, bits_on_device, device)
+            current_lambda_for_loss_calc = args.lambda_sim # Default to final value
+            if args.lambda_sim_warmup_steps > 0 and global_step < args.lambda_sim_warmup_steps:
+                # global_step is 0-indexed for steps completed. We want progress towards the next step.
+                progress = (global_step + 1) / args.lambda_sim_warmup_steps # Progress for the step about to be (potentially) taken
+                current_lambda_for_loss_calc = args.lambda_sim_initial_value + \
+                                   (args.lambda_sim - args.lambda_sim_initial_value) * progress
+                current_lambda_for_loss_calc = min(current_lambda_for_loss_calc, args.lambda_sim) # Cap at final value
+            elif global_step >= args.lambda_sim_warmup_steps: # After warmup or no warmup
+                current_lambda_for_loss_calc = args.lambda_sim
+            # If args.lambda_sim_warmup_steps <= 0, it stays at args.lambda_sim (final value)
             
-            if args.debug:
-                print(f"\n--- Debug: Epoch {epoch+1}, Micro-Batch {batch_idx+1}/{len(train_loader)}, Global Step (pending): {global_step} ---")
+            if args.method == "gumbel":
+                if use_unsloth_flag:
+                    loss, bit_loss, sim_loss, penalty_loss, intermediate_encoded_texts = steg_module.compute_loss(buffers, bits_on_device, device, current_lambda_for_loss_calc, args.lambda_penalty)
+                else: # HF Gumbel, lambda_sim is member, lambda_penalty passed
+                    loss, bit_loss, sim_loss, penalty_loss, intermediate_encoded_texts = steg_module.compute_loss(buffers, bits_on_device, device, args.lambda_penalty)
+            elif args.method == "rl":
+                # RL method might not return penalty_loss directly, or might not have it.
+                # For now, assume it might be adapted or this part needs to be conditional.
+                # If RL needs this, its compute_loss would need to be updated.
+                # For now, let's assume RL compute_loss returns 4 values, the last being intermediate texts
+                loss, bit_loss, sim_loss, intermediate_encoded_texts = steg_module.compute_loss(buffers, bits_on_device, device, current_lambda_for_loss_calc)
+                penalty_loss = torch.tensor(0.0, device=device) # Placeholder if RL doesn't have it
+            
+            if args.debug: # Debug print for every micro-batch
+                print(f"\n--- Debug: Ep {epoch+1}, MB {batch_idx+1}/{len(train_loader)}, GS (curr): {global_step}, Lambda for loss: {current_lambda_for_loss_calc:.4f} ---")
                 print(f'Buffer: {buffers[0]}') 
                 print(f'Encoded (from loss calc): {intermediate_encoded_texts[0]}')
                 print(f"Target Bit: {bits[0].item()}")
@@ -406,20 +451,28 @@ def main():
             # loss, bit_loss, sim_loss are from the current micro-batch
             epoch_bit_loss_sum += bit_loss.item() 
             epoch_sim_loss_sum += sim_loss.item()
+            if args.method == "gumbel": # Only add penalty if gumbel and it's returned
+                epoch_penalty_loss_sum += penalty_loss.item()
             num_micro_batches_processed_epoch += 1
 
             if (batch_idx + 1) % args.accumulate_grad_batches == 0 or (batch_idx + 1) == len(train_loader):
                 optimizer.step()
-                scheduler.step()
+                # scheduler.step() # Removed scheduler step
                 optimizer.zero_grad()
-                global_step += 1
+                global_step += 1 # global_step is now updated to reflect the completed optimizer step
                 num_optimizer_steps_this_epoch += 1
                 
-                # Loss for this optimizer step (sum of accumulated micro-batch losses)
-                # `loss` here is the last micro-batch loss (potentially scaled by accum_grad_batches)
-                # To get the true loss for this step, we'd sum up the unscaled losses of micro-batches.
-                # For simplicity in logging, we log the last micro-batch's main loss value, scaled as if it were the step loss.
-                current_step_loss_val = loss.item() # This is the loss from the last micro-batch in accumulation window
+                lambda_for_log_and_pbar = args.lambda_sim
+                if args.lambda_sim_warmup_steps > 0 and global_step <= args.lambda_sim_warmup_steps:
+                    progress_log = global_step / args.lambda_sim_warmup_steps
+                    lambda_for_log_and_pbar = args.lambda_sim_initial_value + \
+                                       (args.lambda_sim - args.lambda_sim_initial_value) * progress_log
+                    lambda_for_log_and_pbar = min(lambda_for_log_and_pbar, args.lambda_sim) # Cap at final value
+                elif global_step > args.lambda_sim_warmup_steps:
+                     lambda_for_log_and_pbar = args.lambda_sim
+                # If args.lambda_sim_warmup_steps <= 0, it stays args.lambda_sim
+
+                current_step_loss_val = loss.item() 
                 epoch_total_loss_sum += current_step_loss_val 
 
                 if not args.debug:
@@ -427,7 +480,9 @@ def main():
                         "train/step_loss": current_step_loss_val,
                         "train/step_bit_loss": bit_loss.item(), # from last micro-batch
                         "train/step_sim_loss": sim_loss.item(), # from last micro-batch
-                        "learning_rate": scheduler.get_last_lr()[0],
+                        "train/step_penalty_loss": penalty_loss.item() if args.method == "gumbel" else 0.0, # Log penalty loss
+                        "train/current_lambda_sim_step": lambda_for_log_and_pbar, 
+                        "learning_rate": args.lr, # Log fixed learning rate
                         "global_step": global_step
                     })
                 
@@ -435,6 +490,8 @@ def main():
                     "loss (step)": f"{current_step_loss_val:.4f}", 
                     "bit_l (batch)": f"{bit_loss.item():.4f}", 
                     "sim_l (batch)": f"{sim_loss.item():.4f}",
+                    "pen_l (batch)": f"{penalty_loss.item():.4f}" if args.method == "gumbel" else "N/A", # Show penalty loss
+                    "lambda_s": f"{lambda_for_log_and_pbar:.4f}", 
                     "step": global_step
                 })
         
@@ -442,13 +499,15 @@ def main():
         avg_epoch_total_loss = epoch_total_loss_sum / num_optimizer_steps_this_epoch if num_optimizer_steps_this_epoch > 0 else 0
         avg_epoch_bit_loss = epoch_bit_loss_sum / num_micro_batches_processed_epoch if num_micro_batches_processed_epoch > 0 else 0
         avg_epoch_sim_loss = epoch_sim_loss_sum / num_micro_batches_processed_epoch if num_micro_batches_processed_epoch > 0 else 0
+        avg_epoch_penalty_loss = epoch_penalty_loss_sum / num_micro_batches_processed_epoch if num_micro_batches_processed_epoch > 0 and args.method == "gumbel" else 0 # Avg penalty loss
         
-        print(f"Epoch {epoch+1} Training Summary: Avg Total Loss (per optim step): {avg_epoch_total_loss:.4f}, Avg Bit Loss (per micro-batch): {avg_epoch_bit_loss:.4f}, Avg Sim Loss (per micro-batch): {avg_epoch_sim_loss:.4f}")
+        print(f"Epoch {epoch+1} Training Summary: Avg Total Loss (per optim step): {avg_epoch_total_loss:.4f}, Avg Bit Loss (per micro-batch): {avg_epoch_bit_loss:.4f}, Avg Sim Loss (per micro-batch): {avg_epoch_sim_loss:.4f}, Avg Penalty Loss (per micro-batch): {avg_epoch_penalty_loss:.4f}")
         if not args.debug:
             wandb.log({
                 "train/epoch_total_loss": avg_epoch_total_loss,
                 "train/epoch_bit_loss": avg_epoch_bit_loss,
                 "train/epoch_sim_loss": avg_epoch_sim_loss,
+                "train/epoch_penalty_loss": avg_epoch_penalty_loss, # Log avg penalty loss
                 "epoch": epoch + 1
             })
 
