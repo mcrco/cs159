@@ -345,6 +345,7 @@ def main():
 
     # --- Training Loop ---
     global_step = 0
+    best_val_accuracy = 0.0 # Initialize best validation accuracy
     for epoch in range(args.epochs):
         steg_module.train() # Set model to training mode
 
@@ -354,6 +355,7 @@ def main():
         epoch_penalty_loss_sum = 0
         num_optimizer_steps_this_epoch = 0
         num_micro_batches_processed_epoch = 0
+        avg_val_bit_accuracy = 0.0 # Initialize for the current epoch
 
         current_epoch_train_dataset = train_dataset_full
         current_epoch_val_dataset = val_dataset_full
@@ -565,8 +567,14 @@ def main():
         else:
             print(f"Epoch {epoch+1}: No validation loader/data.")
 
+        # Check if current epoch's validation accuracy is the best
+        if val_loader and avg_val_bit_accuracy > best_val_accuracy: # Ensure val_loader exists
+            best_val_accuracy = avg_val_bit_accuracy
+            print(f"Epoch {epoch+1}: New best validation accuracy: {best_val_accuracy:.2f}%. Saving model.")
+            steg_module.save_model() # Save the model with the best validation accuracy
+
     print("Training complete.")
-    steg_module.save_model() # Call the save method from the module
+    # steg_module.save_model() # Removed: Model is saved conditionally based on validation accuracy
 
     # --- Test Loop (After Training) ---
     if test_dataset_full: # Only run if a test dataset was loaded initially
